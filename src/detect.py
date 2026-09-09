@@ -571,6 +571,339 @@ class Tracker:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Multi-target tracking
+# ──────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class MultiTrackerOutput:
+    """Output of the multi-target tracker for one frame."""
+    tracklets: dict  # {beacon_id: TrackerOutput}
+    identity_switches: int  # count of identity switches this frame
+    total_identity_switches: int  # cumulative
+
+
+class MultiTracker:
+    """
+    Multi-target tracker using nearest-neighbor data association.
+
+    Maintains one Tracker per beacon ID. On each frame, the detector finds
+    all blobs in the image, and each detection is assigned to the closest
+    existing track by pixel distance.
+
+    Tracks identity switches: when a track picks up a detection that was
+    previously associated with a different beacon (i.e., two tracks swap
+    assignments).
+
+    Usage:
+        multi_tracker = MultiTracker(beacon_ids=["b1", "b2"])
+        multi_tracker.start()
+        for frame in frames:
+            output = multi_tracker.track(frame)
+    """
+
+    def __init__(self,
+                 beacon_ids: list,
+                 detector: BeaconDetector = None,
+                 acquire_threshold: int = 3,
+                 verify_threshold: int = 2,
+                 acquire_error_threshold: float = 100.0,
+                 lose_threshold: int = 5,
+                 reacquire_timeout_frames: int = 150,
+                 image_width: int = 1280,
+                 image_height: int = 720,
+                 association_max_distance: float = 200.0):
+        """
+        Args:
+            beacon_ids: List of unique beacon ID strings.
+            detector: BeaconDetector instance used by all sub-trackers.
+            acquire_threshold: Consecutive detections to enter TRACKING.
+            verify_threshold: Consecutive detections for CANDIDATE_VERIFICATION.
+            acquire_error_threshold: Pixel error threshold to enter TRACKING.
+            lose_threshold: Consecutive misses before REACQUIRING.
+            reacquire_timeout_frames: Frames before returning to SEARCHING.
+            image_width: Width of the image.
+            image_height: Height of the image.
+            association_max_distance: Max pixel distance for nearest-neighbor
+                association. Detections farther than this from any track are
+                ignored (treated as clutter).
+        """
+        self.beacon_ids = list(beacon_ids)
+        self.association_max_distance = association_max_distance
+        self.total_identity_switches = 0
+        self._prev_assignment = {}  # {detection_idx: beacon_id}
+
+        self.trackers: dict = {}
+        for bid in self.beacon_ids:
+            self.trackers[bid] = Tracker(
+                detector=detector or BeaconDetector(),
+                kalman=KalmanFilter2D(),
+                acquire_threshold=acquire_threshold,
+                verify_threshold=verify_threshold,
+                acquire_error_threshold=acquire_error_threshold,
+                lose_threshold=lose_threshold,
+                reacquire_timeout_frames=reacquire_timeout_frames,
+                image_width=image_width,
+                image_height=image_height,
+            )
+
+    def start(self):
+        """Start all sub-trackers."""
+        for tracker in self.trackers.values():
+            tracker.start()
+
+    def track(self, frame: np.ndarray) -> MultiTrackerOutput:
+        """
+        Process one frame for all tracked beacons.
+
+        1. Run detection on the frame to find all blobs.
+        2. For each existing track, predict the next position.
+        3. Assign each detection to the nearest track (nearest-neighbor).
+        4. Update each track with its assigned detection (or miss).
+        5. Count identity switches (detection reassignment between tracks).
+
+        Args:
+            frame: BGR image from the simulator.
+
+        Returns:
+            MultiTrackerOutput with per-beacon TrackerOutput and identity
+            switch counts.
+        """
+        # 1. Run the detector once to get all blobs
+        detector = self.trackers[self.beacon_ids[0]].detector
+        raw_detection = detector.detect(frame)
+
+        # We need to find ALL blobs, not just the brightest one.
+        # Re-implement blob extraction to get all candidates.
+        all_detections = self._extract_all_detections(frame)
+
+        # 2. Predict all tracks and collect their predicted positions
+        predictions = {}  # {beacon_id: (pred_x, pred_y)}
+        for bid in self.beacon_ids:
+            tracker = self.trackers[bid]
+            if tracker.state == TrackerState.IDLE or tracker.state == TrackerState.FAILED:
+                predictions[bid] = tracker.kalman.get_position()
+            else:
+                predictions[bid] = tracker.kalman.predict()
+
+        # 3. Nearest-neighbor assignment
+        assignments = {}  # {beacon_id: Detection or None}
+        assigned_dets = set()  # indices of detections already assigned
+
+        for bid in self.beacon_ids:
+            pred_x, pred_y = predictions[bid]
+            best_dist = float('inf')
+            best_idx = -1
+
+            for i, det in enumerate(all_detections):
+                if i in assigned_dets or not det.detected:
+                    continue
+                dist = math.hypot(det.cx - pred_x, det.cy - pred_y)
+                if dist < best_dist and dist < self.association_max_distance:
+                    best_dist = dist
+                    best_idx = i
+
+            if best_idx >= 0:
+                assignments[bid] = all_detections[best_idx]
+                assigned_dets.add(best_idx)
+            else:
+                # Create an empty detection (miss)
+                assignments[bid] = Detection()
+
+        # 4. Count identity switches
+        frame_switches = self._count_identity_switches(assignments)
+
+        # 5. Update each track with its assigned detection
+        tracklet_outputs = {}
+        for bid in self.beacon_ids:
+            tracker = self.trackers[bid]
+            detection = assignments[bid]
+
+            # Manually drive the tracker state machine with the assigned detection
+            if tracker.state == TrackerState.IDLE or tracker.state == TrackerState.FAILED:
+                est_x, est_y = tracker.kalman.get_position()
+                tracklet_outputs[bid] = TrackerOutput(
+                    state=tracker.state,
+                    estimated_x=est_x,
+                    estimated_y=est_y,
+                    confidence=0.0,
+                    detected=False,
+                    consecutive_detections=tracker.consecutive_detections,
+                    consecutive_misses=tracker.consecutive_misses,
+                )
+                continue
+
+            # Update Kalman if we have a detection
+            if detection.detected:
+                tracker.kalman.update(detection.cx, detection.cy)
+                tracker.consecutive_detections += 1
+                tracker.consecutive_misses = 0
+                tracker.last_detection = detection
+            else:
+                tracker.consecutive_detections = 0
+                tracker.consecutive_misses += 1
+
+            est_x, est_y = tracker.kalman.get_position()
+            tracker._update_state(detection.detected)
+
+            confidence = detection.confidence if detection.detected else 0.0
+            if not detection.detected and tracker.last_detection is not None:
+                confidence = tracker.last_detection.confidence * 0.5
+
+            tracklet_outputs[bid] = TrackerOutput(
+                state=tracker.state,
+                estimated_x=est_x,
+                estimated_y=est_y,
+                confidence=confidence,
+                detected=detection.detected,
+                consecutive_detections=tracker.consecutive_detections,
+                consecutive_misses=tracker.consecutive_misses,
+            )
+
+        # 6. Store current assignments for next-frame switch detection
+        self._prev_assignment = {}
+        for bid, det in assignments.items():
+            if det.detected:
+                # Store which beacon currently owns each detection region
+                self._prev_assignment[bid] = (det.cx, det.cy)
+
+        self.total_identity_switches += frame_switches
+
+        return MultiTrackerOutput(
+            tracklets=tracklet_outputs,
+            identity_switches=frame_switches,
+            total_identity_switches=self.total_identity_switches,
+        )
+
+    def _extract_all_detections(self, frame: np.ndarray) -> list:
+        """
+        Extract ALL blob detections from a frame, not just the brightest one.
+
+        This is a multi-target extension of the BeaconDetector that returns
+        all qualifying candidates rather than picking the single best.
+        """
+        detector = self.trackers[self.beacon_ids[0]].detector
+
+        if len(frame.shape) == 3:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = frame
+
+        if detector.threshold_method == "otsu":
+            otsu_val, binary = cv2.threshold(
+                gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            otsu_val = max(int(otsu_val), detector.otsu_min_threshold)
+            _, binary = cv2.threshold(gray, otsu_val, 255, cv2.THRESH_BINARY)
+            threshold = otsu_val
+        else:
+            _, binary = cv2.threshold(
+                gray, detector.fixed_threshold, 255, cv2.THRESH_BINARY)
+            threshold = detector.fixed_threshold
+
+        binary = cv2.morphologyEx(
+            binary, cv2.MORPH_OPEN, detector.morph_kernel,
+            iterations=detector.morph_iterations)
+
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            binary, connectivity=8)
+
+        detections = []
+        for i in range(1, num_labels):
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area < detector.min_area or area > detector.max_area:
+                continue
+
+            cx, cy = centroids[i]
+            x = stats[i, cv2.CC_STAT_LEFT]
+            y = stats[i, cv2.CC_STAT_TOP]
+            w = stats[i, cv2.CC_STAT_WIDTH]
+            h = stats[i, cv2.CC_STAT_HEIGHT]
+
+            region = gray[y:y+h, x:x+w]
+            if region.size == 0:
+                continue
+            peak = int(region.max())
+            mean = float(region.mean())
+
+            if threshold > 0:
+                confidence = min(1.0, mean / threshold)
+            else:
+                confidence = min(1.0, mean / 100.0)
+
+            detections.append(Detection(
+                detected=True,
+                cx=float(cx),
+                cy=float(cy),
+                area=float(area),
+                bbox=(int(x), int(y), int(w), int(h)),
+                confidence=float(confidence),
+            ))
+
+        # If no detections found, return one empty detection
+        if not detections:
+            detections.append(Detection())
+
+        return detections
+
+    def _count_identity_switches(self, current_assignments: dict) -> int:
+        """
+        Count identity switches between the previous and current frame.
+
+        An identity switch occurs when two beacons swap which detection
+        they are tracking — e.g., beacon A was tracking detection at (100,100)
+        and beacon B at (200,200), but now A tracks (200,200) and B tracks
+        (100,100).
+
+        We detect this by checking if the set of (beacon, detection-center)
+        pairs changed in a way that indicates a swap.
+        """
+        if not self._prev_assignment:
+            return 0
+
+        # Build current assignment: {beacon_id: (cx, cy)} for detected beacons
+        curr_detected = {}
+        for bid, det in current_assignments.items():
+            if det.detected:
+                curr_detected[bid] = (det.cx, det.cy)
+
+        if not curr_detected:
+            return 0
+
+        # Check for pairwise swaps: two beacons that both had detections
+        # and swapped which detection center they're near
+        switches = 0
+        bids = list(curr_detected.keys())
+        for i in range(len(bids)):
+            for j in range(i + 1, len(bids)):
+                bid_a, bid_b = bids[i], bids[j]
+                if bid_a not in self._prev_assignment or bid_b not in self._prev_assignment:
+                    continue
+                prev_a = self._prev_assignment[bid_a]
+                prev_b = self._prev_assignment[bid_b]
+                curr_a = curr_detected[bid_a]
+                curr_b = curr_detected[bid_b]
+
+                # Swap detected: prev_a was close to curr_a, now close to curr_b, and vice versa
+                dist_a_to_b = math.hypot(curr_a[0] - prev_b[0], curr_a[1] - prev_b[1])
+                dist_b_to_a = math.hypot(curr_b[0] - prev_a[0], curr_b[1] - prev_a[1])
+                dist_a_to_a = math.hypot(curr_a[0] - prev_a[0], curr_a[1] - prev_a[1])
+                dist_b_to_b = math.hypot(curr_b[0] - prev_b[0], curr_b[1] - prev_b[1])
+
+                # If cross-distances are shorter than same-beacon distances, it's a swap
+                if (dist_a_to_b < dist_a_to_a and dist_b_to_a < dist_b_to_b and
+                        dist_a_to_b < self.association_max_distance):
+                    switches += 1
+
+        return switches
+
+    def reset(self):
+        """Reset all sub-trackers."""
+        for tracker in self.trackers.values():
+            tracker.reset()
+        self.total_identity_switches = 0
+        self._prev_assignment = {}
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Self-tests
 # ──────────────────────────────────────────────────────────────────────────
 

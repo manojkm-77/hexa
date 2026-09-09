@@ -18,7 +18,7 @@ Dependencies: numpy, cv2 (OpenCV)
 import numpy as np
 import cv2
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List
 import math
 
 
@@ -727,6 +727,215 @@ class Simulator:
         """Set the camera pan/tilt (called by the controller each frame)."""
         self.cam.pan_deg = pan_deg
         self.cam.tilt_deg = tilt_deg
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Multi-target support
+# ──────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class BeaconConfig:
+    """Configuration for a single beacon in a multi-target scenario."""
+    id: str = "beacon_01"
+    color: tuple = (255, 255, 255)  # BGR
+    intensity: float = 1.0
+    sigma_px: float = 4.0
+    motion_model: MotionModel = None
+
+
+@dataclass
+class MultiGroundTruth:
+    """Ground truth for all beacons in a multi-target frame."""
+    beacons: dict  # {beacon_id: GroundTruth}
+    camera_pan_deg: float
+    camera_tilt_deg: float
+    timestamp: float
+    frame_id: int
+
+
+class MultiTargetSimulator:
+    """
+    Multi-target simulator that manages multiple beacons simultaneously.
+
+    Each beacon has its own identity, color, intensity, sigma, and motion model.
+    step() renders all visible beacons into a single composite frame and returns
+    a list of GroundTruth objects (one per beacon).
+
+    Usage:
+        beacons = [
+            BeaconConfig(id="b1", color=(255,255,255), motion_model=CircularMotion(...)),
+            BeaconConfig(id="b2", color=(0,255,255), motion_model=SinusoidalMotion(...)),
+        ]
+        multi_sim = MultiTargetSimulator(cam=cam, beacons=beacons)
+        for frame_id in range(num_frames):
+            frame, gt_list = multi_sim.step(frame_id)
+    """
+
+    def __init__(self,
+                 cam: CameraState = CameraState(),
+                 beacons: List[BeaconConfig] = None,
+                 vibration: Optional[PlatformVibration] = None,
+                 sensor_noise: Optional[SensorNoise] = None,
+                 motion_blur: Optional[MotionBlur] = None,
+                 fps: float = 30.0):
+        self.cam = cam
+        self.fps = fps
+        self.dt = 1.0 / fps
+        self.t = 0.0
+        self.frame_id = 0
+        self.vibration = vibration
+        self.sensor_noise = sensor_noise
+        self.motion_blur = motion_blur
+
+        if beacons is None:
+            beacons = [BeaconConfig()]
+
+        # Internal state for each beacon
+        self._beacon_configs: List[BeaconConfig] = []
+        self._targets: dict = {}  # {beacon_id: TargetState}
+        self._motions: dict = {}  # {beacon_id: MotionModel}
+        self._renderers: dict = {}  # {beacon_id: FrameRenderer}
+
+        for bc in beacons:
+            self._beacon_configs.append(bc)
+            self._targets[bc.id] = TargetState()
+            self._motions[bc.id] = bc.motion_model or CircularMotion()
+            self._renderers[bc.id] = FrameRenderer(
+                cam,
+                beacon_sigma_px=bc.sigma_px,
+                beacon_peak_intensity=255.0 * bc.intensity,
+            )
+
+    def step(self, frame_id: int) -> tuple[np.ndarray, List[GroundTruth]]:
+        """
+        Advance the simulation by one frame.
+
+        Returns:
+            (frame, ground_truths): frame is the composite image with all
+            visible beacons rendered. ground_truths is a list of GroundTruth
+            objects, one per beacon (regardless of visibility).
+        """
+        # 1. Update all target states
+        for bc in self._beacon_configs:
+            self._motions[bc.id].update(self._targets[bc.id], self.dt, self.t)
+
+        # 2. Copy camera state for disturbance application
+        cam_disturbed = CameraState(
+            pan_deg=self.cam.pan_deg,
+            tilt_deg=self.cam.tilt_deg,
+            width=self.cam.width,
+            height=self.cam.height,
+            h_fov_deg=self.cam.h_fov_deg,
+            v_fov_deg=self.cam.v_fov_deg,
+        )
+
+        # 3. Apply camera disturbances
+        if self.vibration:
+            cam_disturbed = self.vibration.apply(cam_disturbed, self.t)
+
+        # 4. Render the frame with all visible beacons
+        frame = self._renderers[self._beacon_configs[0].id].render_background()
+        for bc in self._beacon_configs:
+            target = self._targets[bc.id]
+            px, py = angular_to_pixel(cam_disturbed,
+                                      target.azimuth_deg, target.elevation_deg)
+            if is_visible(cam_disturbed, px, py):
+                # Draw this beacon with its own color
+                frame = self._render_colored_beacon(
+                    frame, bc, px, py)
+
+        # 5. Apply sensor-level disturbances
+        if self.motion_blur:
+            # Compute aggregate blur from the first beacon's velocity
+            # (simplification for multi-target)
+            first_target = self._targets[self._beacon_configs[0].id]
+            rel_vel_az = first_target.vel_az_deg_s
+            rel_vel_el = first_target.vel_el_deg_s
+            blur_magnitude = np.sqrt(rel_vel_az**2 + rel_vel_el**2)
+            blur_px = blur_magnitude / self.cam.deg_per_pixel_x * self.dt
+            blur_angle = np.degrees(np.arctan2(rel_vel_el, rel_vel_az))
+            frame = self.motion_blur.apply(frame, blur_px, blur_angle)
+
+        if self.sensor_noise:
+            frame = self.sensor_noise.apply(frame)
+
+        # 6. Compute ground truth for each beacon
+        ground_truths = []
+        for bc in self._beacon_configs:
+            target = self._targets[bc.id]
+            gt_px, gt_py = angular_to_pixel(cam_disturbed,
+                                            target.azimuth_deg, target.elevation_deg)
+            gt_visible = is_visible(cam_disturbed, gt_px, gt_py)
+
+            ground_truths.append(GroundTruth(
+                target_az_deg=target.azimuth_deg,
+                target_el_deg=target.elevation_deg,
+                target_pixel_x=gt_px,
+                target_pixel_y=gt_py,
+                target_visible=gt_visible,
+                camera_pan_deg=cam_disturbed.pan_deg,
+                camera_tilt_deg=cam_disturbed.tilt_deg,
+                timestamp=self.t,
+                frame_id=frame_id,
+            ))
+
+        # 7. Advance time
+        self.t += self.dt
+        self.frame_id = frame_id
+
+        return frame, ground_truths
+
+    def _render_colored_beacon(self, frame: np.ndarray, bc: BeaconConfig,
+                               px: float, py: float) -> np.ndarray:
+        """
+        Draw a 2-D Gaussian blob with the beacon's BGR color at (px, py).
+        Uses the beacon's sigma and intensity.
+        """
+        sigma = bc.sigma_px
+        intensity_peak = 255.0 * bc.intensity
+        color = bc.color  # BGR tuple
+
+        r = int(np.ceil(3 * sigma))
+        x0_c = max(0, int(px - r))
+        x1_c = min(self.cam.width, int(px + r) + 1)
+        y0_c = max(0, int(py - r))
+        y1_c = min(self.cam.height, int(py + r) + 1)
+        if x1_c <= x0_c or y1_c <= y0_c:
+            return frame
+
+        xs = np.arange(x0_c, x1_c) - px
+        ys = np.arange(y0_c, y1_c) - py
+        xx, yy = np.meshgrid(xs, ys)
+        gaussian = intensity_peak * np.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+
+        # Apply per-channel color scaling
+        sub = frame[y0_c:y1_c, x0_c:x1_c].astype(np.float32)
+        for c in range(3):
+            sub[:, :, c] += gaussian * (color[c] / 255.0)
+        frame[y0_c:y1_c, x0_c:x1_c] = np.clip(sub, 0, 255).astype(np.uint8)
+        return frame
+
+    def reset(self):
+        """Reset all beacons and time to initial state."""
+        self.t = 0.0
+        self.frame_id = 0
+        for bc in self._beacon_configs:
+            self._targets[bc.id] = TargetState()
+            self._motions[bc.id].reset()
+
+    def set_camera_pose(self, pan_deg: float, tilt_deg: float):
+        """Set the camera pan/tilt (called by the controller each frame)."""
+        self.cam.pan_deg = pan_deg
+        self.cam.tilt_deg = tilt_deg
+
+    @property
+    def beacon_ids(self) -> List[str]:
+        """Return the list of beacon IDs."""
+        return [bc.id for bc in self._beacon_configs]
+
+    def get_target_state(self, beacon_id: str) -> TargetState:
+        """Return the current TargetState for a specific beacon."""
+        return self._targets[beacon_id]
 
 
 # ──────────────────────────────────────────────────────────────────────────

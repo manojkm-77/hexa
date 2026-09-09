@@ -35,6 +35,7 @@ from sim import (Simulator, CameraState, TargetState,
                  GroundTruth)
 from detect import BeaconDetector, KalmanFilter2D, Tracker, TrackerState
 from control import IntegratedController, ControllerOutput
+from report import SummaryReporter, ReportGenerator
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -523,6 +524,22 @@ def run_scenario(scenario_name, config, output_dir, headless=False):
     # Generate plot
     generate_plots(csv_path, plot_path, scenario_name)
     print(f"  Frames saved to {frames_dir}")
+
+    # Generate structured JSON summary and HTML report
+    try:
+        reporter = SummaryReporter()
+        config_dict = {
+            'fps': config.fps, 'duration_s': config.duration_s,
+            'random_seed': config.random_seed,
+            'width': config.width, 'height': config.height,
+            'kp': config.kp, 'ki': config.ki, 'kd': config.kd,
+            'threshold': config.threshold,
+            'scenario': scenario_name,
+        }
+        summary = reporter.generate(csv_path, output_dir, config=config_dict)
+        ReportGenerator.generate_html(csv_path, summary, output_dir)
+    except Exception as e:
+        print(f"  [Report generation failed: {e}]")
 
     if not headless:
         cv2.destroyAllWindows()

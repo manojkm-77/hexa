@@ -87,3 +87,12 @@ class Config:
     occlusion_frequency_hz: float = 0.05
     false_beacon_count: int = 2
     false_beacon_brightness_range: tuple = (80, 180)
+
+    # ── Multi-target ──
+    multi_target: bool = False
+    num_targets: int = 2
+    target_colors: list = None  # default to [(255,255,255), (0,255,255)]
+
+    def __post_init__(self):
+        if self.target_colors is None:
+            self.target_colors = [(255, 255, 255), (0, 255, 255)]
