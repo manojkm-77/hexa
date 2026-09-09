@@ -51,6 +51,22 @@ sim.py  →  detect.py  →  control.py
 - **Import style:** Modules import from siblings directly (e.g., `from sim import CameraState`). Source root is `src/` — run from project root or use `uv run`.
 - **Scenarios:** "clean" = circular trajectory, no disturbances. "hard" = sinusoidal with vibration, noise, and blur. New scenarios go in `make_scenario()` in `src/main.py`.
 
+## Agent Team
+
+Six specialized agents in `.claude/agents/`, each owning a domain from the PRD:
+
+| Agent | Owns | Key File(s) |
+|-------|------|-------------|
+| `sim-engineer` | Virtual environment, camera, motion models, disturbances, rendering | `src/sim.py` |
+| `vision-engineer` | Beacon detection, Kalman filter, tracking FSM | `src/detect.py` |
+| `control-engineer` | PID controller, pan-tilt control, search patterns | `src/control.py` |
+| `systems-engineer` | Main loop, scenarios, HUD, logging, configuration | `src/main.py`, `src/config.py` |
+| `ai-engineer` | AI detector, training data, ONNX export, benchmarking | v1.1 (planned) |
+| `qa-engineer` | Testing, evaluation framework, metrics, acceptance criteria | `tests/` |
+| `architect` | System architecture, module interfaces, integration, code review | Cross-cutting |
+
+Use agents via the Agent tool with `subagent_type` set to the agent name (e.g., `sim-engineer`).
+
 ## Tech Stack
 
 - Python 3.12 (managed by `uv`, see `.python-version`)
