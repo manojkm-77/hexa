@@ -569,18 +569,18 @@ def _test_projection():
     px, py = angular_to_pixel(cam, 10.0, 5.0)
     assert abs(px - cam.cx) < 0.01, f"Expected cx={cam.cx}, got {px}"
     assert abs(py - cam.cy) < 0.01, f"Expected cy={cam.cy}, got {py}"
-    print(f"  Test 1 PASS: boresight → center ({px:.1f}, {py:.1f})")
+    print(f"  Test 1 PASS: boresight -> center ({px:.1f}, {py:.1f})")
 
     # Test 2: target at right edge of FOV → at width pixel
     # The H-FOV spans the full image width, so the right edge is at pan + h_fov/2
     px, py = angular_to_pixel(cam, 10.0 + cam.h_fov_deg / 2.0, 5.0)
     assert abs(px - cam.width) < 0.01, f"Expected width={cam.width}, got {px}"
-    print(f"  Test 2 PASS: +half H-FOV → right edge ({px:.1f}, {py:.1f})")
+    print(f"  Test 2 PASS: +half H-FOV -> right edge ({px:.1f}, {py:.1f})")
 
     # Test 3: target above boresight → y < cy
     px, py = angular_to_pixel(cam, 10.0, 5.0 + 5.0)
     assert py < cam.cy, f"Expected py < cy={cam.cy}, got {py}"
-    print(f"  Test 3 PASS: above boresight → y < cy ({px:.1f}, {py:.1f})")
+    print(f"  Test 3 PASS: above boresight -> y < cy ({px:.1f}, {py:.1f})")
 
     # Test 4: round-trip (angular → pixel → angular)
     az, el = 25.3, -7.2
@@ -588,7 +588,7 @@ def _test_projection():
     az2, el2 = pixel_to_angular(cam, px, py)
     assert abs(az - az2) < 1e-6, f"Azimuth round-trip failed: {az} vs {az2}"
     assert abs(el - el2) < 1e-6, f"Elevation round-trip failed: {el} vs {el2}"
-    print(f"  Test 4 PASS: round-trip az={az:.3f}→{az2:.3f}, el={el:.3f}→{el2:.3f}")
+    print(f"  Test 4 PASS: round-trip az={az:.3f}->{az2:.3f}, el={el:.3f}->{el2:.3f}")
 
     print("All projection tests passed.\n")
 

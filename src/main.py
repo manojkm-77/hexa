@@ -553,7 +553,7 @@ def main():
     # Shorten duration for testing; restore to 60 for the real demo
     if os.environ.get('FSOC_TEST_MODE', '0') == '1':
         config.duration_s = 10
-    output_dir = "/scratch/work/results"
+    output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results")
     os.makedirs(output_dir, exist_ok=True)
 
     # Default scenario
@@ -561,7 +561,8 @@ def main():
 
     # Check if running headless (no display)
     headless = False
-    if os.environ.get('DISPLAY', '') == '':
+    display_val = os.environ.get('DISPLAY', '')
+    if display_val == '' or display_val == 'needs-to-be-defined':
         headless = True
     else:
         try:
@@ -571,7 +572,9 @@ def main():
             cv2.destroyWindow("test")
         except Exception:
             headless = True
-        print("  [Headless mode — no display available]")
+
+    if headless:
+        print("  [Headless mode - no display available]")
         print("  Running both scenarios automatically...\n")
 
     if headless:
