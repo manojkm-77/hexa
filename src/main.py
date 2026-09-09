@@ -15,6 +15,7 @@ Controls:
 Dependencies: numpy, cv2, matplotlib
 """
 
+import sys
 import numpy as np
 import cv2
 import csv
@@ -32,7 +33,8 @@ from sim import (Simulator, CameraState, TargetState,
                  ConstantVelocity, SinusoidalMotion, CircularMotion,
                  RandomManeuvering,
                  PlatformVibration, SensorNoise, MotionBlur,
-                 GroundTruth)
+                 GroundTruth,
+                 AtmosphericTurbulence, ExposureVariation, Occlusion, FalseBeacons)
 from detect import BeaconDetector, KalmanFilter2D, Tracker, TrackerState
 from control import IntegratedController, ControllerOutput
 from report import SummaryReporter, ReportGenerator
@@ -43,7 +45,15 @@ from report import SummaryReporter, ReportGenerator
 # ──────────────────────────────────────────────────────────────────────────
 
 def make_scenario(config: Config, scenario_name: str):
-    """Create a simulator and controller for a named scenario."""
+    """Create a simulator and controller for a named scenario.
+
+    Returns
+    -------
+    tuple
+        (sim, controller, disturbances) where disturbances is a dict of
+        v1.1 disturbance objects (may contain None values when the
+        corresponding config parameter is zero).
+    """
     cam = CameraState(
         pan_deg=0.0, tilt_deg=0.0,
         width=config.width, height=config.height,
@@ -77,6 +87,37 @@ def make_scenario(config: Config, scenario_name: str):
     else:
         raise ValueError(f"Unknown scenario: {scenario_name}")
 
+    # v1.1 disturbances
+    turbulence = AtmosphericTurbulence(
+        rms_deg=config.turbulence_rms_deg,
+        correlation_time_s=config.turbulence_correlation_s,
+        seed=config.random_seed + 2,
+    ) if config.turbulence_rms_deg > 0 else None
+
+    exposure = ExposureVariation(
+        rate_hz=config.exposure_rate_hz,
+        amplitude=config.exposure_amplitude,
+        seed=config.random_seed + 3,
+    ) if config.exposure_amplitude > 0 else None
+
+    occlusion = Occlusion(
+        duration_s=config.occlusion_duration_s,
+        frequency_hz=config.occlusion_frequency_hz,
+        seed=config.random_seed + 4,
+    ) if config.occlusion_frequency_hz > 0 else None
+
+    false_beacons = FalseBeacons(
+        count=config.false_beacon_count,
+        seed=config.random_seed + 5,
+    ) if config.false_beacon_count > 0 else None
+
+    disturbances = {
+        'turbulence': turbulence,
+        'exposure': exposure,
+        'occlusion': occlusion,
+        'false_beacons': false_beacons,
+    }
+
     sim = Simulator(
         cam=cam, motion=motion,
         beacon_sigma_px=config.beacon_sigma_px,
@@ -106,7 +147,7 @@ def make_scenario(config: Config, scenario_name: str):
         deadband_pixels=config.deadband_pixels,
     )
 
-    return sim, controller
+    return sim, controller, disturbances
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -399,7 +440,7 @@ def run_scenario(scenario_name, config, output_dir, headless=False):
     print(f"  Scenario: {scenario_name.upper()}")
     print(f"{'='*60}")
 
-    sim, controller = make_scenario(config, scenario_name)
+    sim, controller, disturbances = make_scenario(config, scenario_name)
     num_frames = int(config.duration_s * config.fps)
 
     run_id = f"{scenario_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -431,8 +472,21 @@ def run_scenario(scenario_name, config, output_dir, headless=False):
         t0 = time.time()
 
         if not paused:
+            # ── Apply v1.1 camera-level disturbances before rendering ──
+            if disturbances.get('turbulence'):
+                disturbances['turbulence'].apply(sim.cam, sim.t)
+
             # ── The main loop ──
             frame, gt = sim.step(frame_id)
+
+            # ── Apply v1.1 frame-level disturbances after rendering ──
+            if disturbances.get('exposure'):
+                frame = disturbances['exposure'].apply(frame, gt.timestamp)
+            if disturbances.get('occlusion'):
+                frame = disturbances['occlusion'].apply(frame, gt.timestamp)
+            if disturbances.get('false_beacons'):
+                frame = disturbances['false_beacons'].apply(frame, gt.timestamp)
+
             cmd = controller.update(frame, sim.cam.pan_deg, sim.cam.tilt_deg)
             sim.set_camera_pose(cmd.pan_cmd_deg, cmd.tilt_cmd_deg)
 
@@ -557,6 +611,75 @@ def main():
     print("  AI-Based Coarse-Alignment Simulator")
     print("=" * 60)
     print()
+
+    # ── CLI argument parsing ─────────────────────────────────────────
+    scenario_arg = None
+    yaml_path = None
+    for arg in sys.argv[1:]:
+        if arg == '--eval':
+            continue  # handled below
+        if arg.startswith('--scenario='):
+            scenario_arg = arg.split('=', 1)[1]
+        elif arg == '--scenario':
+            idx = sys.argv.index('--scenario')
+            if idx + 1 < len(sys.argv):
+                scenario_arg = sys.argv[idx + 1]
+        elif arg.startswith('--yaml='):
+            yaml_path = arg.split('=', 1)[1]
+        elif arg == '--yaml':
+            idx = sys.argv.index('--yaml')
+            if idx + 1 < len(sys.argv):
+                yaml_path = sys.argv[idx + 1]
+
+    # ── Headless evaluation mode ──────────────────────────────────────
+    if '--eval' in sys.argv:
+        from evaluation import (
+            run_full_evaluation,
+            CATEGORIES,
+            DEFAULT_SEEDS,
+        )
+        print("  Running evaluation framework...")
+        print()
+
+        eval_output = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "results")
+        os.makedirs(eval_output, exist_ok=True)
+
+        # Parse optional arguments
+        duration_s = 10
+        seeds = DEFAULT_SEEDS
+        for arg in sys.argv:
+            if arg.startswith('--duration='):
+                duration_s = int(arg.split('=')[1])
+            if arg.startswith('--seeds='):
+                seeds = [int(s) for s in arg.split('=')[1].split(',')]
+
+        report = run_full_evaluation(
+            seeds=seeds,
+            duration_s=duration_s,
+            output_dir=eval_output,
+            quiet=True,
+        )
+
+        # Print the evaluation matrix
+        print("\n" + "=" * 60)
+        print("  FSOC EVALUATION MATRIX")
+        print("=" * 60)
+        for cat_name in CATEGORIES:
+            score = report.get(cat_name, 0.0)
+            print(f"  {cat_name:<24} {score:>6.1f} / 100")
+        print("-" * 60)
+        print(f"  {'OVERALL':<24} {report.get('overall', 0.0):>6.1f} / 100")
+        print("=" * 60)
+
+        # Save results as JSON
+        import json
+        results_path = os.path.join(eval_output, "evaluation_results.json")
+        with open(results_path, 'w') as f:
+            json.dump(report, f, indent=2, default=str)
+        print(f"\n  Results saved to: {results_path}")
+        return
+
     print("  Controls:")
     print("    SPACE — start/pause")
     print("    R     — reset")
@@ -566,7 +689,15 @@ def main():
     print("    Q/ESC — quit")
     print()
 
-    config = Config()
+    # ── Load config from YAML or use defaults ────────────────────────
+    if yaml_path:
+        from yaml_config import load_scenario, scenario_to_config
+        scenario_dict = load_scenario(yaml_path)
+        config = scenario_to_config(scenario_dict)
+        print(f"  Loaded config from: {yaml_path}")
+    else:
+        config = Config()
+
     # Shorten duration for testing; restore to 60 for the real demo
     if os.environ.get('FSOC_TEST_MODE', '0') == '1':
         config.duration_s = 10
@@ -574,7 +705,7 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
 
     # Default scenario
-    scenario = "clean"
+    scenario = scenario_arg or "clean"
 
     # Check if running headless (no display)
     headless = False
@@ -595,27 +726,34 @@ def main():
         print("  Running both scenarios automatically...\n")
 
     if headless:
-        # Run both scenarios and produce reports
+        # If a specific scenario was requested, only run that one
+        if scenario_arg:
+            scenarios_to_run = [scenario_arg]
+        else:
+            scenarios_to_run = ["clean", "hard"]
+
+        # Run scenarios and produce reports
         all_stats = {}
-        for sc in ["clean", "hard"]:
+        for sc in scenarios_to_run:
             stats, csv_path, plot_path = run_scenario(sc, config, output_dir, headless=True)
             all_stats[sc] = (stats, csv_path, plot_path)
 
-        # Print comparison
-        print("\n" + "=" * 60)
-        print("  COMPARISON")
-        print("=" * 60)
-        print(f"{'Metric':<25} {'Clean':>12} {'Hard':>12}")
-        print("-" * 50)
-        for key in ['acquisition_time_s', 'mean_error_px', 'max_error_px',
-                     'lock_retention_pct', 'num_losses', 'detection_rate',
-                     'rms_angular_error_deg', 'mean_fps']:
-            clean_val = all_stats['clean'][0].get(key, 'N/A')
-            hard_val = all_stats['hard'][0].get(key, 'N/A')
-            if isinstance(clean_val, float) and isinstance(hard_val, float):
-                print(f"{key:<25} {clean_val:>12.2f} {hard_val:>12.2f}")
-            else:
-                print(f"{key:<25} {str(clean_val):>12} {str(hard_val):>12}")
+        # Print comparison (only when running multiple scenarios)
+        if len(scenarios_to_run) > 1:
+            print("\n" + "=" * 60)
+            print("  COMPARISON")
+            print("=" * 60)
+            print(f"{'Metric':<25} {'Clean':>12} {'Hard':>12}")
+            print("-" * 50)
+            for key in ['acquisition_time_s', 'mean_error_px', 'max_error_px',
+                         'lock_retention_pct', 'num_losses', 'detection_rate',
+                         'rms_angular_error_deg', 'mean_fps']:
+                clean_val = all_stats.get('clean', ({}))[0].get(key, 'N/A') if 'clean' in all_stats else 'N/A'
+                hard_val = all_stats.get('hard', ({}))[0].get(key, 'N/A') if 'hard' in all_stats else 'N/A'
+                if isinstance(clean_val, float) and isinstance(hard_val, float):
+                    print(f"{key:<25} {clean_val:>12.2f} {hard_val:>12.2f}")
+                else:
+                    print(f"{key:<25} {str(clean_val):>12} {str(hard_val):>12}")
 
         print(f"\n  CSV logs and plots saved to: {output_dir}/")
         return
