@@ -1,0 +1,42 @@
+name: hard
+description: "Sinusoidal trajectory with vibration, noise, and blur — robustness test"
+simulation:
+  fps: 30
+  duration_s: 60
+  random_seed: 42
+camera:
+  width: 1280
+  height: 720
+  h_fov_deg: 60.0
+  v_fov_deg: 40.0
+  pan_range: [-180.0, 180.0]
+  tilt_range: [-30.0, 90.0]
+  rate_limit_deg_s: 60.0
+beacon:
+  sigma_px: 4.0
+  peak: 255.0
+motion:
+  type: sinusoidal
+  az_amp_deg: 10.0
+  az_freq_hz: 0.2
+  el_amp_deg: 6.0
+  el_freq_hz: 0.3
+disturbances:
+  vibration_rms_deg: 0.2
+  noise_sigma: 12.0
+  blur_pixels: 3.0
+detector:
+  threshold: 80
+  min_area: 2
+  max_area: 500
+kalman:
+  measurement_noise: 8.0
+controller:
+  kp: 1.0
+  ki: 0.0
+  kd: 0.15
+  deadband_pixels: 3.0
+tracker:
+  acquire_threshold: 3
+  lose_threshold: 5
+  reacquire_timeout: 150
