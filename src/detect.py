@@ -15,6 +15,7 @@ Dependencies: numpy, cv2
 
 import numpy as np
 import cv2
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -37,10 +38,30 @@ class Detection:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# DetectorBase — abstract interface for all beacon detectors
+# ──────────────────────────────────────────────────────────────────────────
+
+class DetectorBase(ABC):
+    """Common interface for all beacon detectors (classical, AI, etc.)."""
+
+    @abstractmethod
+    def detect(self, frame: np.ndarray) -> Detection:
+        """Detect the beacon in a single frame.
+
+        Args:
+            frame: BGR or grayscale image (np.ndarray)
+
+        Returns:
+            Detection with centroid, area, bbox, and confidence.
+        """
+        ...
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Beacon detector — classical brightness + connected components
 # ──────────────────────────────────────────────────────────────────────────
 
-class BeaconDetector:
+class BeaconDetector(DetectorBase):
     """
     Classical beacon detector.
 
@@ -154,6 +175,69 @@ class BeaconDetector:
                 )
 
         return best_detection
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Alpha-beta filter — simpler alternative to Kalman
+# ──────────────────────────────────────────────────────────────────────────
+
+class AlphaBetaFilter:
+    """Simpler alternative to KalmanFilter2D.
+
+    State: [x, y, vx, vy]
+    Uses fixed alpha (position) and beta (velocity) gains.
+    Simpler than Kalman but sufficient for many tracking scenarios.
+    """
+
+    def __init__(self, alpha: float = 0.5, beta: float = 0.1, dt: float = 1.0/30.0,
+                 initial_x: float = 640.0, initial_y: float = 360.0):
+        self.alpha = alpha
+        self.beta = beta
+        self.dt = dt
+        self.x = initial_x
+        self.y = initial_y
+        self.vx = 0.0
+        self.vy = 0.0
+        self._initialized = False
+
+    def predict(self) -> tuple[float, float]:
+        """Predict next position. Called every frame."""
+        self.x += self.vx * self.dt
+        self.y += self.vy * self.dt
+        return (self.x, self.y)
+
+    def update(self, x: float, y: float) -> None:
+        """Update with measurement."""
+        if not self._initialized:
+            self.x = x
+            self.y = y
+            self._initialized = True
+            return
+        # Innovation
+        dx = x - self.x
+        dy = y - self.y
+        # Update position
+        self.x += self.alpha * dx
+        self.y += self.alpha * dy
+        # Update velocity
+        self.vx += self.beta * dx / self.dt
+        self.vy += self.beta * dy / self.dt
+
+    def reset(self, x: float = 640.0, y: float = 360.0) -> None:
+        """Reset filter state."""
+        self.x = x
+        self.y = y
+        self.vx = 0.0
+        self.vy = 0.0
+        self._initialized = False
+
+    @property
+    def position(self) -> tuple[float, float]:
+        return (self.x, self.y)
+
+    @property
+    def velocity(self) -> tuple[float, float]:
+        return (self.vx, self.vy)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -277,10 +361,13 @@ class KalmanFilter2D:
 
 class TrackerState(Enum):
     """Finite state machine states for the beacon tracker."""
-    SEARCHING = "SEARCHING"        # Sweeping for the beacon
-    ACQUIRING = "ACQUIRING"        # Confirming detections before committing
-    TRACKING = "TRACKING"          # Locked on, continuous feedback
-    REACQUIRING = "REACQUIRING"    # Lost track, predicting + searching locally
+    IDLE = "IDLE"                            # Not started
+    SEARCHING = "SEARCHING"                  # Sweeping for the beacon
+    CANDIDATE_VERIFICATION = "CANDIDATE_VERIFICATION"  # Verifying a candidate detection
+    ACQUIRING = "ACQUIRING"                  # Confirming detections before committing
+    TRACKING = "TRACKING"                    # Locked on, continuous feedback
+    REACQUIRING = "REACQUIRING"              # Lost track, predicting + searching locally
+    FAILED = "FAILED"                        # Fatal error, requires reset
 
 
 @dataclass
@@ -304,18 +391,25 @@ class Tracker:
     get back the estimated position, confidence, and current state.
 
     State transitions:
-        SEARCHING  --detection-->  ACQUIRING
-        ACQUIRING  --3 consecutive detections-->  TRACKING
-        ACQUIRING  --miss-->  SEARCHING
-        TRACKING   --5 consecutive misses-->  REACQUIRING
+        IDLE  --start()-->  SEARCHING
+        SEARCHING  --detection-->  CANDIDATE_VERIFICATION
+        CANDIDATE_VERIFICATION  --verify_threshold consecutive detections-->  ACQUIRING
+        CANDIDATE_VERIFICATION  --miss-->  SEARCHING
+        ACQUIRING  --acquire_threshold consecutive detections (error OK)-->  TRACKING
+        ACQUIRING  --timeout-->  SEARCHING
+        TRACKING   --lose_threshold consecutive misses-->  REACQUIRING
         REACQUIRING --detection-->  TRACKING
         REACQUIRING --timeout-->  SEARCHING
+        Any --fatal error-->  FAILED
+        FAILED  --reset()-->  IDLE
     """
 
     def __init__(self,
                  detector: BeaconDetector = None,
                  kalman: KalmanFilter2D = None,
-                 acquire_threshold: int = 3,       # consecutive detections needed
+                 acquire_threshold: int = 3,       # consecutive detections to enter TRACKING
+                 verify_threshold: int = 2,         # consecutive detections for CANDIDATE_VERIFICATION
+                 acquire_error_threshold: float = 100.0,  # pixel error to enter TRACKING
                  lose_threshold: int = 5,            # consecutive misses before reacquire
                  reacquire_timeout_frames: int = 150, # ~5 seconds at 30 FPS
                  image_width: int = 1280,
@@ -323,16 +417,23 @@ class Tracker:
         self.detector = detector or BeaconDetector()
         self.kalman = kalman or KalmanFilter2D()
         self.acquire_threshold = acquire_threshold
+        self.verify_threshold = verify_threshold
+        self.acquire_error_threshold = acquire_error_threshold
         self.lose_threshold = lose_threshold
         self.reacquire_timeout = reacquire_timeout_frames
         self.img_w = image_width
         self.img_h = image_height
 
-        self.state = TrackerState.SEARCHING
+        self.state = TrackerState.IDLE
         self.consecutive_detections = 0
         self.consecutive_misses = 0
         self.reacquire_counter = 0
         self.last_detection: Optional[Detection] = None
+
+    def start(self):
+        """Transition from IDLE to SEARCHING. Call this to begin tracking."""
+        if self.state == TrackerState.IDLE:
+            self.state = TrackerState.SEARCHING
 
     def track(self, frame: np.ndarray) -> TrackerOutput:
         """
@@ -344,6 +445,32 @@ class Tracker:
         Returns:
             TrackerOutput with state, estimated position, and confidence.
         """
+        # IDLE: no-op, return current estimate
+        if self.state == TrackerState.IDLE:
+            est_x, est_y = self.kalman.get_position()
+            return TrackerOutput(
+                state=self.state,
+                estimated_x=est_x,
+                estimated_y=est_y,
+                confidence=0.0,
+                detected=False,
+                consecutive_detections=self.consecutive_detections,
+                consecutive_misses=self.consecutive_misses,
+            )
+
+        # FAILED: no-op, return current estimate
+        if self.state == TrackerState.FAILED:
+            est_x, est_y = self.kalman.get_position()
+            return TrackerOutput(
+                state=self.state,
+                estimated_x=est_x,
+                estimated_y=est_y,
+                confidence=0.0,
+                detected=False,
+                consecutive_detections=self.consecutive_detections,
+                consecutive_misses=self.consecutive_misses,
+            )
+
         # 1. Always predict (advance Kalman even without detection)
         pred_x, pred_y = self.kalman.predict()
 
@@ -388,12 +515,31 @@ class Tracker:
             if detected:
                 self.kalman.initialize(
                     self.last_detection.cx, self.last_detection.cy)
-                self.state = TrackerState.ACQUIRING
+                self.state = TrackerState.CANDIDATE_VERIFICATION
                 self.consecutive_detections = 1
+
+        elif self.state == TrackerState.CANDIDATE_VERIFICATION:
+            if detected:
+                if self.consecutive_detections >= self.verify_threshold:
+                    self.state = TrackerState.ACQUIRING
+                    self.consecutive_detections = 0
+            else:
+                self.state = TrackerState.SEARCHING
+                self.consecutive_detections = 0
 
         elif self.state == TrackerState.ACQUIRING:
             if detected and self.consecutive_detections >= self.acquire_threshold:
-                self.state = TrackerState.TRACKING
+                # Check pixel error between Kalman estimate and last detection
+                pred_x, pred_y = self.kalman.get_position()
+                error = math.hypot(pred_x - self.last_detection.cx,
+                                   pred_y - self.last_detection.cy)
+                if error < self.acquire_error_threshold:
+                    self.state = TrackerState.TRACKING
+                else:
+                    # Error too large -- go back to SEARCHING
+                    self.state = TrackerState.SEARCHING
+                    self.consecutive_detections = 0
+                    self.kalman.reset()
             elif not detected:
                 self.state = TrackerState.SEARCHING
                 self.consecutive_detections = 0
@@ -416,7 +562,7 @@ class Tracker:
 
     def reset(self):
         """Reset tracker to initial state."""
-        self.state = TrackerState.SEARCHING
+        self.state = TrackerState.IDLE
         self.consecutive_detections = 0
         self.consecutive_misses = 0
         self.reacquire_counter = 0
@@ -521,8 +667,13 @@ def _test_state_machine():
     )
 
     # Verify initial state
-    assert tracker.state == TrackerState.SEARCHING
+    assert tracker.state == TrackerState.IDLE
     print(f"  Initial state: {tracker.state.value}")
+
+    # Start the tracker
+    tracker.start()
+    assert tracker.state == TrackerState.SEARCHING
+    print(f"  After start(): {tracker.state.value}")
 
     # Simulate detections to move through states
     # We need a frame with a beacon to trigger detection
@@ -547,8 +698,10 @@ def _test_state_machine():
                       f"pos=({result.estimated_x:.1f}, {result.estimated_y:.1f}), "
                       f"dets={result.consecutive_detections}")
 
-    # Should have seen SEARCHING (initial, verified above) and at least ACQUIRING + TRACKING
+    # Should have seen SEARCHING (verified above), CANDIDATE_VERIFICATION, ACQUIRING, and TRACKING
     assert TrackerState.TRACKING in states_seen, "Never entered TRACKING"
+    assert TrackerState.ACQUIRING in states_seen, "Never entered ACQUIRING"
+    assert TrackerState.CANDIDATE_VERIFICATION in states_seen, "Never entered CANDIDATE_VERIFICATION"
     print(f"  States observed: {[s.value for s in states_seen]}")
     print("State machine test passed.\n")
 
@@ -571,6 +724,7 @@ def _test_tracker_with_disturbances():
         acquire_threshold=3,
         lose_threshold=5,
     )
+    tracker.start()
 
     detections = 0
     tracking_frames = 0

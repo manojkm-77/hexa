@@ -49,9 +49,11 @@ class Config:
     deadband_pixels: float = 3.0  # ignore errors below this
 
     # ── Tracker FSM ──
-    acquire_threshold: int = 3     # consecutive detections to enter TRACKING
-    lose_threshold: int = 5         # consecutive misses to enter REACQUIRING
-    reacquire_timeout: int = 150    # frames before returning to SEARCHING (~5s)
+    verify_threshold: int = 2               # consecutive detections for CANDIDATE_VERIFICATION
+    acquire_error_threshold: float = 100.0  # pixel error threshold to enter TRACKING
+    acquire_threshold: int = 3              # consecutive detections to enter TRACKING
+    lose_threshold: int = 5                 # consecutive misses to enter REACQUIRING
+    reacquire_timeout: int = 150            # frames before returning to SEARCHING (~5s)
 
     # ── Clean scenario ──
     # Circular trajectory, no disturbances. Shows ideal tracking.
@@ -75,3 +77,13 @@ class Config:
     hard_vibration_rms: float = 0.2
     hard_noise_sigma: float = 12.0
     hard_blur_pixels: float = 3.0
+
+    # ── v1.1 disturbances ──
+    turbulence_rms_deg: float = 0.1
+    turbulence_correlation_s: float = 1.0
+    exposure_rate_hz: float = 0.1
+    exposure_amplitude: float = 0.3
+    occlusion_duration_s: float = 1.0
+    occlusion_frequency_hz: float = 0.05
+    false_beacon_count: int = 2
+    false_beacon_brightness_range: tuple = (80, 180)

@@ -202,7 +202,7 @@ class TestKalmanFilter2D:
 # ---------------------------------------------------------------------------
 
 class TestTrackerFSM:
-    """Tracker state machine should transition through SEARCHING -> ACQUIRING -> TRACKING -> REACQUIRING."""
+    """Tracker state machine should transition through the 7-state FSM."""
 
     def _make_frame_with_beacon(self, width=320, height=240, cx=160, cy=120):
         """Create a frame with a detectable beacon."""
@@ -219,39 +219,91 @@ class TestTrackerFSM:
     def _make_empty_frame(self, width=320, height=240):
         return np.zeros((height, width, 3), dtype=np.uint8)
 
-    def test_initial_state_is_searching(self):
+    def test_initial_state_is_idle(self):
         tracker = Tracker(
             acquire_threshold=3,
             lose_threshold=5,
             reacquire_timeout_frames=10,
         )
+        assert tracker.state == TrackerState.IDLE
+
+    def test_idle_to_searching_via_start(self):
+        tracker = Tracker(
+            acquire_threshold=3,
+            lose_threshold=5,
+            reacquire_timeout_frames=10,
+        )
+        assert tracker.state == TrackerState.IDLE
+        tracker.start()
         assert tracker.state == TrackerState.SEARCHING
 
-    def test_searching_to_acquiring_on_detection(self):
+    def test_searching_to_candidate_verification_on_detection(self):
         tracker = Tracker(
             acquire_threshold=3,
+            verify_threshold=2,
             lose_threshold=5,
             reacquire_timeout_frames=10,
         )
+        tracker.start()
         frame = self._make_frame_with_beacon()
         result = tracker.track(frame)
 
-        # On first detection, should move to ACQUIRING
-        assert result.state == TrackerState.ACQUIRING
+        # On first detection, should move to CANDIDATE_VERIFICATION
+        assert result.state == TrackerState.CANDIDATE_VERIFICATION
         assert result.detected is True
         assert result.consecutive_detections == 1
+
+    def test_candidate_verification_to_acquiring_after_threshold(self):
+        verify_threshold = 2
+        tracker = Tracker(
+            acquire_threshold=3,
+            verify_threshold=verify_threshold,
+            lose_threshold=5,
+            reacquire_timeout_frames=10,
+        )
+        tracker.start()
+        frame = self._make_frame_with_beacon()
+
+        # Feed enough detections to cross the verify threshold
+        for i in range(verify_threshold + 1):
+            result = tracker.track(frame)
+
+        assert result.state == TrackerState.ACQUIRING
+
+    def test_candidate_verification_resets_on_miss(self):
+        tracker = Tracker(
+            acquire_threshold=3,
+            verify_threshold=2,
+            lose_threshold=5,
+            reacquire_timeout_frames=10,
+        )
+        tracker.start()
+        beacon_frame = self._make_frame_with_beacon()
+        empty_frame = self._make_empty_frame()
+
+        # One detection enters CANDIDATE_VERIFICATION
+        tracker.track(beacon_frame)
+        assert tracker.state == TrackerState.CANDIDATE_VERIFICATION
+
+        # Miss resets to SEARCHING
+        tracker.track(empty_frame)
+        assert tracker.state == TrackerState.SEARCHING
 
     def test_acquiring_to_tracking_after_threshold(self):
         acquire_threshold = 3
         tracker = Tracker(
             acquire_threshold=acquire_threshold,
+            verify_threshold=2,
             lose_threshold=5,
             reacquire_timeout_frames=10,
         )
+        tracker.start()
         frame = self._make_frame_with_beacon()
 
         # Feed enough detections to cross the acquire threshold
-        for i in range(acquire_threshold + 1):
+        # 1: SEARCHING->CANDIDATE_VERIFICATION, 2: CV threshold->ACQUIRING,
+        # then acquire_threshold more detections for ACQUIRING->TRACKING
+        for i in range(acquire_threshold + 2):
             result = tracker.track(frame)
 
         assert result.state == TrackerState.TRACKING
@@ -259,13 +311,16 @@ class TestTrackerFSM:
     def test_acquiring_resets_on_miss(self):
         tracker = Tracker(
             acquire_threshold=3,
+            verify_threshold=2,
             lose_threshold=5,
             reacquire_timeout_frames=10,
         )
+        tracker.start()
         beacon_frame = self._make_frame_with_beacon()
         empty_frame = self._make_empty_frame()
 
-        # Start acquiring
+        # Enter CANDIDATE_VERIFICATION, then ACQUIRING
+        tracker.track(beacon_frame)
         tracker.track(beacon_frame)
         assert tracker.state == TrackerState.ACQUIRING
 
@@ -277,14 +332,16 @@ class TestTrackerFSM:
         lose_threshold = 5
         tracker = Tracker(
             acquire_threshold=3,
+            verify_threshold=2,
             lose_threshold=lose_threshold,
             reacquire_timeout_frames=10,
         )
+        tracker.start()
         beacon_frame = self._make_frame_with_beacon()
         empty_frame = self._make_empty_frame()
 
         # Get to TRACKING
-        for _ in range(4):
+        for _ in range(6):
             tracker.track(beacon_frame)
         assert tracker.state == TrackerState.TRACKING
 
@@ -297,14 +354,16 @@ class TestTrackerFSM:
     def test_reacquiring_to_tracking_on_redetection(self):
         tracker = Tracker(
             acquire_threshold=3,
+            verify_threshold=2,
             lose_threshold=5,
             reacquire_timeout_frames=10,
         )
+        tracker.start()
         beacon_frame = self._make_frame_with_beacon()
         empty_frame = self._make_empty_frame()
 
         # Get to TRACKING
-        for _ in range(4):
+        for _ in range(6):
             tracker.track(beacon_frame)
 
         # Lose track (enter REACQUIRING)
@@ -312,7 +371,7 @@ class TestTrackerFSM:
             tracker.track(empty_frame)
         assert tracker.state == TrackerState.REACQUIRING
 
-        # Redetect → back to TRACKING
+        # Redetect -> back to TRACKING
         result = tracker.track(beacon_frame)
         assert result.state == TrackerState.TRACKING
 
@@ -320,14 +379,16 @@ class TestTrackerFSM:
         timeout = 5
         tracker = Tracker(
             acquire_threshold=3,
+            verify_threshold=2,
             lose_threshold=5,
             reacquire_timeout_frames=timeout,
         )
+        tracker.start()
         beacon_frame = self._make_frame_with_beacon()
         empty_frame = self._make_empty_frame()
 
         # Get to TRACKING
-        for _ in range(4):
+        for _ in range(6):
             tracker.track(beacon_frame)
 
         # Lose track
@@ -343,6 +404,7 @@ class TestTrackerFSM:
 
     def test_tracker_output_fields(self):
         tracker = Tracker()
+        tracker.start()
         frame = self._make_frame_with_beacon()
         result = tracker.track(frame)
 
@@ -363,9 +425,11 @@ class TestTrackerFSM:
         sim = Simulator(cam=cam, motion=motion, beacon_sigma_px=5.0)
         tracker = Tracker(
             acquire_threshold=3,
+            verify_threshold=2,
             lose_threshold=5,
             reacquire_timeout_frames=10,
         )
+        tracker.start()
 
         states_seen = set()
         for i in range(90):
@@ -380,14 +444,16 @@ class TestTrackerFSM:
     def test_tracker_reset(self):
         tracker = Tracker(
             acquire_threshold=3,
+            verify_threshold=2,
             lose_threshold=5,
             reacquire_timeout_frames=10,
         )
+        tracker.start()
         frame = self._make_frame_with_beacon()
         tracker.track(frame)
         tracker.track(frame)
 
         tracker.reset()
-        assert tracker.state == TrackerState.SEARCHING
+        assert tracker.state == TrackerState.IDLE
         assert tracker.consecutive_detections == 0
         assert tracker.consecutive_misses == 0
