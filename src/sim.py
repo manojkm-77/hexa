@@ -356,6 +356,181 @@ class MotionBlur:
         return cv2.filter2D(frame, -1, kernel)
 
 
+class AtmosphericTurbulence:
+    """
+    Atmospheric turbulence: low-frequency random angular displacement using
+    an Ornstein-Uhlenbeck process. Models slowly varying pointing errors on
+    the camera boresight caused by refractive index fluctuations in the
+    atmosphere.
+    """
+
+    def __init__(self, rms_deg: float = 0.1, correlation_time_s: float = 1.0, seed: int = 42):
+        self.rms = rms_deg
+        self.tau = correlation_time_s
+        self.rng = np.random.default_rng(seed)
+        # OU process: theta = drift * theta_prev + noise
+        # drift = exp(-dt / tau), noise std = rms * sqrt(1 - exp(-2*dt/tau))
+        # We pre-compute nothing here since dt varies; state is kept in _offset.
+        self._offset_az = 0.0
+        self._offset_el = 0.0
+
+    def apply(self, cam: CameraState, t: float) -> CameraState:
+        """
+        Return a new camera state with atmospheric turbulence offset applied.
+
+        Uses an Ornstein-Uhlenbeck filter: each call advances the internal
+        filtered angular offset by one timestep, producing smooth, slowly
+        varying pointing errors with the configured RMS.
+        """
+        # Step size: use a fixed internal dt derived from the correlation time
+        # to keep the process stable regardless of frame rate.
+        dt = self.tau / 10.0
+        decay = np.exp(-dt / self.tau)
+        noise_std = self.rms * np.sqrt(1.0 - np.exp(-2.0 * dt / self.tau))
+
+        self._offset_az = decay * self._offset_az + self.rng.normal(0.0, noise_std)
+        self._offset_el = decay * self._offset_el + self.rng.normal(0.0, noise_std)
+
+        cam.pan_deg += self._offset_az
+        cam.tilt_deg += self._offset_el
+        return cam
+
+
+class ExposureVariation:
+    """
+    Exposure variation: brightness and gain modulation via a sinusoidal signal.
+    Models slow variations in beacon contrast due to scintillation and
+    detector gain instability.
+    """
+
+    def __init__(self, rate_hz: float = 0.1, amplitude: float = 0.3, seed: int = 42):
+        self.rate = rate_hz
+        self.amplitude = amplitude
+        self.rng = np.random.default_rng(seed)
+        # Random phase offset for reproducibility
+        self._phase = self.rng.uniform(0, 2 * np.pi)
+
+    def apply(self, frame: np.ndarray, t: float) -> np.ndarray:
+        """
+        Return a modified frame with sinusoidal brightness modulation applied.
+
+        Factor = 1.0 + amplitude * sin(2*pi*rate*t + phase), then
+        frame = clip(frame * factor, 0, 255).
+        """
+        factor = 1.0 + self.amplitude * np.sin(2 * np.pi * self.rate * t + self._phase)
+        modulated = frame.astype(np.float32) * factor
+        return np.clip(modulated, 0, 255).astype(np.uint8)
+
+
+class Occlusion:
+    """
+    Occlusion: random or scripted masked regions that temporarily block
+    parts of the frame. Models debris, birds, or other transient occluders
+    that force temporary track loss.
+    """
+
+    def __init__(self, duration_s: float = 1.0, frequency_hz: float = 0.05,
+                 region_size_frac: float = 0.15, seed: int = 42):
+        self.duration = duration_s
+        self.frequency = frequency_hz
+        self.region_size_frac = region_size_frac
+        self.rng = np.random.default_rng(seed)
+
+    def apply(self, frame: np.ndarray, t: float) -> np.ndarray:
+        """
+        Return a frame with a black rectangle mask drawn during occlusion periods.
+
+        Occlusion on/off timing is determined deterministically by a sine wave
+        threshold: when sin(2*pi*frequency*t) > 0 and the fractional phase is
+        within [0, duration*frequency), an occlusion is active.
+        """
+        phase = (self.frequency * t) % 1.0
+        is_occluded = (np.sin(2 * np.pi * self.frequency * t) > 0.0) and (phase < self.frequency * self.duration)
+
+        if not is_occluded:
+            return frame
+
+        h, w = frame.shape[:2]
+        rw = max(1, int(w * self.region_size_frac))
+        rh = max(1, int(h * self.region_size_frac))
+
+        # Deterministic position from seeded RNG
+        x = self.rng.integers(0, max(1, w - rw))
+        y = self.rng.integers(0, max(1, h - rh))
+
+        occluded = frame.copy()
+        occluded[y:y + rh, x:x + rw] = 0
+        return occluded
+
+
+class FalseBeacons:
+    """
+    False beacons: distractor points with similar appearance to the real
+    beacon. Tests identification robustness of the detector and tracker
+    against spurious targets.
+    """
+
+    def __init__(self, count: int = 2, brightness_range: tuple = (80, 180),
+                 sigma_range: tuple = (2.0, 5.0), seed: int = 42):
+        self.count = count
+        self.brightness_range = brightness_range
+        self.sigma_range = sigma_range
+        self.rng = np.random.default_rng(seed)
+        # Pre-compute fixed positions and base parameters from the seed
+        self._positions = None  # lazily initialized on first apply
+        self._sigmas = None
+        self._base_brightness = None
+
+    def _init_positions(self, h: int, w: int):
+        """Generate fixed random positions, sigmas, and base brightness values."""
+        self._positions = []
+        self._sigmas = self.rng.uniform(self.sigma_range[0], self.sigma_range[1], self.count)
+        self._base_brightness = self.rng.uniform(
+            self.brightness_range[0], self.brightness_range[1], self.count
+        )
+        margin = 20
+        for _ in range(self.count):
+            x = self.rng.uniform(margin, w - margin)
+            y = self.rng.uniform(margin, h - margin)
+            self._positions.append((x, y))
+
+    def apply(self, frame: np.ndarray, t: float) -> np.ndarray:
+        """
+        Return a frame with additional Gaussian blobs drawn at fixed random
+        positions. Blob brightness varies slightly per frame to simulate
+        flickering distractor beacons.
+        """
+        h, w = frame.shape[:2]
+        if self._positions is None:
+            self._init_positions(h, w)
+
+        result = frame.astype(np.float32)
+
+        for i, (px, py) in enumerate(self._positions):
+            sigma = self._sigmas[i]
+            # Slight per-frame brightness variation
+            flicker = 1.0 + 0.1 * np.sin(2 * np.pi * 0.3 * t + i * 1.5)
+            brightness = self._base_brightness[i] * flicker
+
+            # Region of influence: +/-3 sigma
+            r = int(np.ceil(3 * sigma))
+            x0 = max(0, int(px - r))
+            x1 = min(w, int(px + r) + 1)
+            y0 = max(0, int(py - r))
+            y1 = min(h, int(py + r) + 1)
+            if x1 <= x0 or y1 <= y0:
+                continue
+
+            xs = np.arange(x0, x1) - px
+            ys = np.arange(y0, y1) - py
+            xx, yy = np.meshgrid(xs, ys)
+            gaussian = brightness * np.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+
+            result[y0:y1, x0:x1] += gaussian[:, :, np.newaxis]
+
+        return np.clip(result, 0, 255).astype(np.uint8)
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Frame renderer
 # ──────────────────────────────────────────────────────────────────────────
