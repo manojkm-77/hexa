@@ -22,20 +22,21 @@ from config import Config
 
 
 # ── Required top-level sections ──────────────────────────────────────────
-_REQUIRED_SECTIONS = {"simulation", "camera", "beacon", "detector",
-                      "kalman", "controller", "tracker"}
+# Only simulation, camera, and motion are truly required.
+# Other sections (beacon, detector, kalman, controller, tracker) use Config defaults.
+_REQUIRED_SECTIONS = {"simulation", "camera"}
 
 # ── Required keys inside each section ────────────────────────────────────
 _REQUIRED_KEYS: dict[str, list[str]] = {
     "simulation": ["fps", "duration_s"],
-    "camera": ["width", "height", "h_fov_deg", "v_fov_deg"],
-    "beacon": ["sigma_px", "peak"],
+    "camera": ["width", "height"],
+    "beacon": [],
     "motion": ["type"],
     "disturbances": [],
-    "detector": ["threshold", "min_area", "max_area"],
-    "kalman": ["measurement_noise"],
-    "controller": ["kp", "ki", "kd", "deadband_pixels"],
-    "tracker": ["acquire_threshold", "lose_threshold", "reacquire_timeout"],
+    "detector": [],
+    "kalman": [],
+    "controller": [],
+    "tracker": [],
 }
 
 
@@ -76,6 +77,11 @@ def load_scenario(yaml_path: str) -> dict:
     if not isinstance(scenario, dict):
         print(f"[yaml_config] {yaml_path} must be a mapping at the top level, got {type(scenario).__name__}")
         raise ValueError(f"Scenario file must be a YAML mapping: {yaml_path}")
+
+    # ── Version check (optional, informational) ──
+    version = scenario.get("version")
+    if version:
+        print(f"[yaml_config] Scenario version: {version}")
 
     # ── Validate ──
     errors = _validate(scenario)
@@ -174,11 +180,24 @@ def scenario_to_config(scenario: dict) -> Config:
     if "reacquire_timeout" in trk:
         kwargs["reacquire_timeout"] = _int(trk["reacquire_timeout"])
 
-    # ── Scenario-specific motion + disturbance fields ──
-    prefix = "clean" if motion_type == "circular" else "hard"
+    # ── Filter selection ──
+    if "filter_type" in klm:
+        kwargs["filter_type"] = str(klm["filter_type"])
+    if "alpha" in klm:
+        kwargs["alpha"] = _float(klm["alpha"])
+    if "beta" in klm:
+        kwargs["beta"] = _float(klm["beta"])
 
-    kwargs["clean_motion"] = "circular"
-    kwargs["hard_motion"] = "sinusoidal"
+    # ── Detector selection ──
+    if "detector_type" in det:
+        kwargs["detector_type"] = str(det["detector_type"])
+    if "ai_model_path" in det:
+        kwargs["ai_model_path"] = str(det["ai_model_path"])
+
+    # ── Scenario-specific motion + disturbance fields ──
+
+    kwargs["clean_motion"] = "circular" if motion_type == "circular" else motion_type
+    kwargs["hard_motion"] = "sinusoidal" if motion_type == "sinusoidal" else motion_type
 
     # Motion parameters
     if motion_type == "circular":
@@ -191,6 +210,15 @@ def scenario_to_config(scenario: dict) -> Config:
         kwargs["hard_az_freq"] = _float(mot.get("az_freq_hz", 0.2))
         kwargs["hard_el_amp"] = _float(mot.get("el_amp_deg", 6.0))
         kwargs["hard_el_freq"] = _float(mot.get("el_freq_hz", 0.3))
+    elif motion_type == "random":
+        kwargs["clean_motion"] = "random"
+        kwargs["clean_max_acc"] = _float(mot.get("max_acc_deg_s2", 10.0))
+        kwargs["clean_change_interval"] = _float(mot.get("change_interval_s", 2.0))
+        kwargs["clean_max_vel"] = _float(mot.get("max_vel_deg_s", 20.0))
+    elif motion_type == "constant":
+        kwargs["clean_motion"] = "constant"
+        kwargs["clean_az_rate"] = _float(mot.get("az_rate_deg_s", 5.0))
+        kwargs["clean_el_rate"] = _float(mot.get("el_rate_deg_s", 2.0))
     else:
         raise ValueError(f"Unknown motion type: {motion_type}")
 
@@ -204,7 +232,130 @@ def scenario_to_config(scenario: dict) -> Config:
         kwargs["hard_noise_sigma"] = _float(dst.get("noise_sigma", 0.0))
         kwargs["hard_blur_pixels"] = _float(dst.get("blur_pixels", 0.0))
 
+    # ── v1.1 disturbances (scenario-independent) ──
+    if "turbulence_rms_deg" in dst:
+        kwargs["turbulence_rms_deg"] = _float(dst["turbulence_rms_deg"])
+    if "turbulence_correlation_s" in dst:
+        kwargs["turbulence_correlation_s"] = _float(dst["turbulence_correlation_s"])
+    if "exposure_rate_hz" in dst:
+        kwargs["exposure_rate_hz"] = _float(dst["exposure_rate_hz"])
+    if "exposure_amplitude" in dst:
+        kwargs["exposure_amplitude"] = _float(dst["exposure_amplitude"])
+    if "occlusion_duration_s" in dst:
+        kwargs["occlusion_duration_s"] = _float(dst["occlusion_duration_s"])
+    if "occlusion_frequency_hz" in dst:
+        kwargs["occlusion_frequency_hz"] = _float(dst["occlusion_frequency_hz"])
+    if "false_beacon_count" in dst:
+        kwargs["false_beacon_count"] = _int(dst["false_beacon_count"])
+    if "false_beacon_brightness_range" in dst:
+        kwargs["false_beacon_brightness_range"] = tuple(dst["false_beacon_brightness_range"])
+
     return Config(**kwargs)
+
+
+def config_to_scenario(config: Config, scenario_name: str = "custom") -> dict:
+    """Convert a flat Config dataclass into a structured scenario dict conforming to YAML schema."""
+    motion_type = config.clean_motion if scenario_name != "hard" else config.hard_motion
+    if motion_type not in ("circular", "sinusoidal", "random", "constant"):
+        motion_type = "circular"
+
+    mot_dict: dict[str, Any] = {"type": motion_type}
+    if motion_type == "circular":
+        mot_dict["center_az_deg"] = float(config.clean_center_az)
+        mot_dict["center_el_deg"] = float(config.clean_center_el)
+        mot_dict["radius_deg"] = float(config.clean_radius)
+        mot_dict["speed_deg_s"] = float(config.clean_speed)
+    elif motion_type == "sinusoidal":
+        mot_dict["az_amp_deg"] = float(config.hard_az_amp)
+        mot_dict["az_freq_hz"] = float(config.hard_az_freq)
+        mot_dict["el_amp_deg"] = float(config.hard_el_amp)
+        mot_dict["el_freq_hz"] = float(config.hard_el_freq)
+    elif motion_type == "random":
+        mot_dict["max_acc_deg_s2"] = float(config.clean_max_acc)
+        mot_dict["change_interval_s"] = float(config.clean_change_interval)
+        mot_dict["max_vel_deg_s"] = float(config.clean_max_vel)
+    elif motion_type == "constant":
+        mot_dict["az_rate_deg_s"] = float(config.clean_az_rate)
+        mot_dict["el_rate_deg_s"] = float(config.clean_el_rate)
+
+    vibration_rms = config.hard_vibration_rms if scenario_name == "hard" else config.clean_vibration_rms
+    noise_sigma = config.hard_noise_sigma if scenario_name == "hard" else config.clean_noise_sigma
+    blur_pixels = config.hard_blur_pixels if scenario_name == "hard" else config.clean_blur_pixels
+
+    dst_dict = {
+        "vibration_rms_deg": float(vibration_rms),
+        "noise_sigma": float(noise_sigma),
+        "blur_pixels": float(blur_pixels),
+        "turbulence_rms_deg": float(config.turbulence_rms_deg),
+        "turbulence_correlation_s": float(config.turbulence_correlation_s),
+        "exposure_rate_hz": float(config.exposure_rate_hz),
+        "exposure_amplitude": float(config.exposure_amplitude),
+        "occlusion_duration_s": float(config.occlusion_duration_s),
+        "occlusion_frequency_hz": float(config.occlusion_frequency_hz),
+        "false_beacon_count": int(config.false_beacon_count),
+    }
+
+    scenario = {
+        "name": scenario_name,
+        "version": "1.1",
+        "description": f"Scenario {scenario_name} exported from FSOC Simulator",
+        "simulation": {
+            "fps": int(config.fps),
+            "duration_s": int(config.duration_s),
+            "random_seed": int(config.random_seed),
+        },
+        "camera": {
+            "width": int(config.width),
+            "height": int(config.height),
+            "h_fov_deg": float(config.h_fov_deg),
+            "v_fov_deg": float(config.v_fov_deg),
+            "pan_range": list(config.pan_range),
+            "tilt_range": list(config.tilt_range),
+            "rate_limit_deg_s": float(config.rate_limit_deg_s),
+        },
+        "beacon": {
+            "sigma_px": float(config.beacon_sigma_px),
+            "peak": float(config.beacon_peak),
+        },
+        "motion": mot_dict,
+        "disturbances": dst_dict,
+        "detector": {
+            "threshold": int(config.threshold),
+            "min_area": int(config.min_area),
+            "max_area": int(config.max_area),
+            "detector_type": str(config.detector_type),
+        },
+        "kalman": {
+            "measurement_noise": float(config.measurement_noise),
+            "filter_type": str(config.filter_type),
+            "alpha": float(config.alpha),
+            "beta": float(config.beta),
+        },
+        "controller": {
+            "kp": float(config.kp),
+            "ki": float(config.ki),
+            "kd": float(config.kd),
+            "deadband_pixels": float(config.deadband_pixels),
+        },
+        "tracker": {
+            "acquire_threshold": int(config.acquire_threshold),
+            "verify_threshold": int(config.verify_threshold),
+            "acquire_error_threshold": float(config.acquire_error_threshold),
+            "lose_threshold": int(config.lose_threshold),
+            "reacquire_timeout": int(config.reacquire_timeout),
+        },
+    }
+    return scenario
+
+
+def save_scenario(config: Config, yaml_path: str, scenario_name: str = "custom") -> None:
+    """Save a Config instance to a YAML scenario file."""
+    scenario_dict = config_to_scenario(config, scenario_name)
+    path = Path(yaml_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        yaml.dump(scenario_dict, fh, default_flow_style=False, sort_keys=False)
+
 
 
 # ── Internal helpers ─────────────────────────────────────────────────────
@@ -244,8 +395,8 @@ def _validate(scenario: dict) -> list[str]:
     mot = scenario.get("motion", {})
     if isinstance(mot, dict):
         mt = mot.get("type", "circular")
-        if mt not in ("circular", "sinusoidal"):
-            errors.append(f"Unknown motion type: '{mt}' (must be 'circular' or 'sinusoidal')")
+        if mt not in ("circular", "sinusoidal", "random", "constant"):
+            errors.append(f"Unknown motion type: '{mt}' (must be 'circular', 'sinusoidal', 'random', or 'constant')")
 
     return errors
 

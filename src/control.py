@@ -36,6 +36,8 @@ class ControllerOutput:
     error_tilt_deg: float    # angular error in tilt
     error_pixels: float      # Euclidean pixel error from image center
     saturated: bool           # whether rate limiting was applied
+    pan_saturated: bool = False   # pan axis rate-limited (PRD FR-CT10)
+    tilt_saturated: bool = False  # tilt axis rate-limited (PRD FR-CT10)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -227,8 +229,9 @@ class PanTiltController:
         new_pan, pan_rate = self.pan_pid.compute(error_pan_deg, self.current_pan)
         new_tilt, tilt_rate = self.tilt_pid.compute(error_tilt_deg, self.current_tilt)
 
-        saturated = abs(new_pan - self.current_pan) > self.pan_pid.rate_limit * self.dt - 0.01 or \
-                    abs(new_tilt - self.current_tilt) > self.tilt_pid.rate_limit * self.dt - 0.01
+        pan_saturated = abs(new_pan - self.current_pan) > self.pan_pid.rate_limit * self.dt - 0.01
+        tilt_saturated = abs(new_tilt - self.current_tilt) > self.tilt_pid.rate_limit * self.dt - 0.01
+        saturated = pan_saturated or tilt_saturated
 
         return ControllerOutput(
             pan_cmd_deg=new_pan,
@@ -239,6 +242,8 @@ class PanTiltController:
             error_tilt_deg=error_tilt_deg,
             error_pixels=float(error_pixels),
             saturated=saturated,
+            pan_saturated=pan_saturated,
+            tilt_saturated=tilt_saturated,
         )
 
     def reset(self):
@@ -356,6 +361,7 @@ class IntegratedController:
             sweep_rate_deg_s=rate_limit_deg_s,
         )
         self.tracking_center_threshold_px = cam.width * 0.10  # central 20% = 10% radius
+        self.last_track_output = None  # TrackerOutput from most recent update()
 
     def update(self, frame: np.ndarray,
                current_pan: float, current_tilt: float) -> ControllerOutput:
@@ -371,6 +377,7 @@ class IntegratedController:
         """
         # 1. Run the tracker (detector + Kalman + state machine)
         track_result = self.tracker.track(frame)
+        self.last_track_output = track_result
 
         state = track_result.state
         est_x = track_result.estimated_x

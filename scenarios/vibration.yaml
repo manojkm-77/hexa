@@ -1,0 +1,26 @@
+# Evaluation category: Vibration — circular motion with platform vibration
+version: "1.1"
+simulation:
+  fps: 30
+  duration_s: 10
+camera:
+  width: 1280
+  height: 720
+  h_fov_deg: 60.0
+  v_fov_deg: 40.0
+motion:
+  type: circular
+disturbances:
+  vibration_rms_deg: 0.2
+  noise_sigma: 0.0
+  blur_pixels: 0.0
+  turbulence_rms_deg: 0.0
+  occlusion_duration_s: 0.0
+  false_beacon_count: 0
+  exposure_rate_hz: 0.0
+detector:
+  threshold: 80
+controller:
+  kp: 1.0
+  ki: 0.0
+  kd: 0.15

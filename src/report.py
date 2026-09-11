@@ -17,8 +17,6 @@ import csv
 import json
 import os
 import base64
-import io
-from pathlib import Path
 from typing import Optional
 
 
@@ -104,12 +102,12 @@ class SummaryReporter:
         ang_errors = [float(r['angular_error_deg']) for r in rows]
         pan_cmds = [float(r['pan_cmd']) for r in rows]
         tilt_cmds = [float(r['tilt_cmd']) for r in rows]
-        pan_actual = [float(r['pan_actual']) for r in rows]
-        tilt_actual = [float(r['tilt_actual']) for r in rows]
         detected_flags = [int(r['detected']) for r in rows]
         states = [r['tracker_state'] for r in rows]
 
         fps = float(rows[0].get('fps', 30))  # nominal FPS for time conversion
+        if fps <= 0:
+            fps = 30.0  # fallback for frame-0 where FPS counter hasn't updated yet
 
         # --- Duration ---
         simulation_duration_s = n / fps
@@ -161,21 +159,14 @@ class SummaryReporter:
         lock_retention_pct = (tracking_count / n * 100) if n > 0 else 0.0
 
         # --- Loss events and mean loss duration ---
-        loss_events, total_loss_frames = self._count_loss_events(states, fps)
+        loss_events, total_loss_frames = self._count_loss_events(states)
         mean_loss_duration_s = (total_loss_frames / fps / loss_events) if loss_events > 0 else 0.0
 
         # --- Reacquisition time ---
         reacquisition_time_s = self._compute_reacquisition_time(states, fps)
 
         # --- Time in center (central 20%) ---
-        center_x, center_y = 640.0, 360.0  # default resolution
-        # Try to infer resolution from first row
-        if rows:
-            try:
-                gt_x_first = float(rows[0]['gt_x'])
-                # Use 1280x720 as default
-            except (KeyError, ValueError):
-                pass
+        center_x, center_y = 640.0, 360.0  # 1280x720 default resolution
         # Central 20% region: x in [256, 1024], y in [144, 576]
         center_tolerance_x = 1280 * 0.10  # 10% radius from center
         center_tolerance_y = 720 * 0.10
@@ -233,7 +224,7 @@ class SummaryReporter:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _count_loss_events(states: list[str], fps: float) -> tuple[int, int]:
+    def _count_loss_events(states: list[str]) -> tuple[int, int]:
         """Count transitions from TRACKING to REACQUIRING and total lost frames."""
         losses = 0
         total_loss_frames = 0
@@ -448,11 +439,12 @@ class ReportGenerator:
     @staticmethod
     def _render_limitations() -> str:
         return """    <ul>
-      <li>Single-target tracking only (no multi-beacon scenarios).</li>
-      <li>Fixed-threshold detector — no adaptive thresholding.</li>
-      <li>No occlusion or weather disturbance models in v1.0.</li>
-      <li>Camera model assumes ideal lens with no distortion.</li>
-      <li>PID gains are static — no online adaptation.</li>
+      <li>Camera model assumes ideal pinhole lens with no distortion.</li>
+      <li>PID gains are static — no online gain adaptation.</li>
+      <li>AI detector requires a pre-trained ONNX model (not included).</li>
+      <li>Multi-target tracking uses nearest-neighbor association (no JPDA/MHT).</li>
+      <li>Atmospheric turbulence model is a simplified Ornstein-Uhlenbeck process.</li>
+      <li>No closed-loop adaptive optics or wavefront correction.</li>
     </ul>"""
 
     @staticmethod

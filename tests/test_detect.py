@@ -371,8 +371,9 @@ class TestTrackerFSM:
             tracker.track(empty_frame)
         assert tracker.state == TrackerState.REACQUIRING
 
-        # Redetect -> back to TRACKING
-        result = tracker.track(beacon_frame)
+        # Redetect -> back to TRACKING (needs verify_threshold consecutive detections)
+        tracker.track(beacon_frame)  # 1st consecutive detection
+        result = tracker.track(beacon_frame)  # 2nd -> transitions to TRACKING
         assert result.state == TrackerState.TRACKING
 
     def test_reacquiring_to_searching_on_timeout(self):

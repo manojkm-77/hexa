@@ -20,6 +20,7 @@ class Config:
     fps: int = 30
     duration_s: int = 60
     random_seed: int = 42
+    save_frames: bool = False  # save every frame as JPEG (slow, for evidence only)
 
     # ── Camera ──
     width: int = 1280
@@ -34,10 +35,21 @@ class Config:
     beacon_sigma_px: float = 4.0
     beacon_peak: float = 255.0
 
+    # ── Detector selection ──
+    detector_type: str = "classical"  # "classical" or "ai"
+    ai_model_path: str = ""
+
     # ── Detector ──
     threshold: int = 80           # fixed brightness threshold
     min_area: int = 2             # min blob size (pixels)
     max_area: int = 500           # max blob size (pixels)
+
+    # ── Filter selection ──
+    filter_type: str = "kalman"  # "kalman" or "alpha_beta"
+
+    # ── Alpha-beta filter ──
+    alpha: float = 0.5
+    beta: float = 0.1
 
     # ── Kalman filter ──
     measurement_noise: float = 8.0  # higher = trusts detections less
@@ -62,6 +74,11 @@ class Config:
     clean_center_el: float = 3.0
     clean_radius: float = 8.0
     clean_speed: float = 4.0       # deg/s along the circle
+    clean_max_acc: float = 10.0    # max acceleration for random motion (deg/s^2)
+    clean_change_interval: float = 2.0  # direction change interval for random (s)
+    clean_max_vel: float = 20.0    # max velocity for random motion (deg/s)
+    clean_az_rate: float = 5.0     # azimuth rate for constant motion (deg/s)
+    clean_el_rate: float = 2.0     # elevation rate for constant motion (deg/s)
     clean_vibration_rms: float = 0.0
     clean_noise_sigma: float = 0.0
     clean_blur_pixels: float = 0.0
@@ -78,15 +95,21 @@ class Config:
     hard_noise_sigma: float = 12.0
     hard_blur_pixels: float = 3.0
 
-    # ── v1.1 disturbances ──
-    turbulence_rms_deg: float = 0.1
+    # ── v1.1 disturbances (default=0 → clean is truly clean) ──
+    turbulence_rms_deg: float = 0.0
     turbulence_correlation_s: float = 1.0
-    exposure_rate_hz: float = 0.1
+    exposure_rate_hz: float = 0.0
     exposure_amplitude: float = 0.3
-    occlusion_duration_s: float = 1.0
+    occlusion_duration_s: float = 0.0
     occlusion_frequency_hz: float = 0.05
-    false_beacon_count: int = 2
+    false_beacon_count: int = 0
     false_beacon_brightness_range: tuple = (80, 180)
+
+    # ── v1.1 hard-scenario overrides ──
+    hard_turbulence_rms_deg: float = 0.1
+    hard_exposure_rate_hz: float = 0.1
+    hard_occlusion_duration_s: float = 1.0
+    hard_false_beacon_count: int = 2
 
     # ── Multi-target ──
     multi_target: bool = False

@@ -15,6 +15,7 @@ Coordinate system:
 Dependencies: numpy, cv2 (OpenCV)
 """
 
+import os
 import numpy as np
 import cv2
 from dataclasses import dataclass, field
@@ -223,6 +224,7 @@ class RandomManeuvering(MotionModel):
         self.max_acc = max_acc_deg_s2
         self.change_interval = change_interval_s
         self.max_vel = max_vel_deg_s
+        self._seed = seed
         self.rng = np.random.default_rng(seed)
         self._acc_az = 0.0
         self._acc_el = 0.0
@@ -232,7 +234,7 @@ class RandomManeuvering(MotionModel):
         self._acc_az = 0.0
         self._acc_el = 0.0
         self._next_change = 0.0
-        self.rng = np.random.default_rng(self.rng.integers(0, 2**31))
+        self.rng = np.random.default_rng(self._seed)  # deterministic reset
 
     def update(self, state: TargetState, dt: float, t: float) -> TargetState:
         # Randomly change acceleration at intervals
@@ -259,6 +261,36 @@ class RandomManeuvering(MotionModel):
         return state
 
 
+class ScriptedTrajectory(MotionModel):
+    """Replays a trajectory from a list of (az, el) positions."""
+
+    def __init__(self, positions: list, fps: float = 30.0):
+        """
+        Args:
+            positions: List of (azimuth_deg, elevation_deg) tuples, one per frame.
+            fps: Frames per second (for time indexing).
+        """
+        self.positions = positions
+        self.fps = fps
+        self._index = 0
+
+    def update(self, state: TargetState, dt: float, t: float) -> TargetState:
+        """Set (az, el) at time t by index lookup."""
+        idx = min(int(t * self.fps), len(self.positions) - 1)
+        idx = max(0, idx)
+        az, el = self.positions[idx]
+        state.azimuth_deg = az
+        state.elevation_deg = el
+        state.vel_az_deg_s = 0.0
+        state.vel_el_deg_s = 0.0
+        state.acc_az_deg_s2 = 0.0
+        state.acc_el_deg_s2 = 0.0
+        return state
+
+    def reset(self):
+        self._index = 0
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Disturbance models — each has an apply() method
 # ──────────────────────────────────────────────────────────────────────────
@@ -279,7 +311,7 @@ class PlatformVibration:
         self.jitter_rng = np.random.default_rng(seed + 1)
 
     def apply(self, cam: CameraState, t: float) -> CameraState:
-        """Return a new camera state with vibration offset applied."""
+        """Return a NEW camera state with vibration offset applied (never mutates input)."""
         offset_az = sum(a * np.sin(2 * np.pi * f * t + p)
                         for a, f, p in zip(self.amplitudes, self.freqs, self.phases))
         offset_el = sum(a * np.cos(2 * np.pi * f * t + p)
@@ -289,34 +321,45 @@ class PlatformVibration:
         offset_az += self.jitter_rng.normal(0, self.rms * 0.2)
         offset_el += self.jitter_rng.normal(0, self.rms * 0.2)
 
-        cam.pan_deg += offset_az
-        cam.tilt_deg += offset_el
-        return cam
+        return CameraState(
+            pan_deg=cam.pan_deg + offset_az,
+            tilt_deg=cam.tilt_deg + offset_el,
+            width=cam.width, height=cam.height,
+            h_fov_deg=cam.h_fov_deg, v_fov_deg=cam.v_fov_deg,
+        )
 
 
 class SensorNoise:
     """
-    Sensor noise: additive Gaussian noise on pixel values.
+    Sensor noise: additive Gaussian noise on pixel values,
+    optionally combined with Poisson noise.
     Models sensor readout noise and thermal noise.
     """
 
-    def __init__(self, sigma: float = 8.0, seed: int = 42):
+    def __init__(self, sigma: float = 8.0, seed: int = 42, use_poisson: bool = False):
         self.sigma = sigma
         self.rng = np.random.default_rng(seed)
+        self.use_poisson = use_poisson
 
     def apply(self, frame: np.ndarray) -> np.ndarray:
-        """Add Gaussian noise to the frame."""
-        # cv2.randn is significantly faster than numpy's Generator.normal
-        # for large arrays. Generate on a single channel and broadcast.
+        """Add Gaussian noise (and optionally Poisson noise) to the frame."""
+        # Use seeded NumPy RNG for reproducibility (NF-RE2/NF-RE3).
+        # cv2.randn uses OpenCV's internal RNG which cannot be seeded externally.
         h, w = frame.shape[:2]
-        noise2d = np.empty((h, w), dtype=np.float32)
-        cv2.randn(noise2d, 0.0, self.sigma)
+        noise2d = self.rng.normal(0.0, self.sigma, size=(h, w)).astype(np.float32)
         if len(frame.shape) == 3:
             noise = noise2d[:, :, np.newaxis]
         else:
             noise = noise2d
         noisy = frame.astype(np.float32) + noise
-        return np.clip(noisy, 0, 255).astype(np.uint8)
+        frame = np.clip(noisy, 0, 255).astype(np.uint8)
+
+        if self.use_poisson:
+            # Poisson noise: converts intensity to rate parameter
+            poisson_noise = self.rng.poisson(frame.astype(np.float32)).astype(np.uint8)
+            frame = cv2.addWeighted(frame, 0.7, poisson_noise, 0.3, 0)
+
+        return frame
 
 
 class MotionBlur:
@@ -376,11 +419,10 @@ class AtmosphericTurbulence:
 
     def apply(self, cam: CameraState, t: float) -> CameraState:
         """
-        Return a new camera state with atmospheric turbulence offset applied.
-
-        Uses an Ornstein-Uhlenbeck filter: each call advances the internal
-        filtered angular offset by one timestep, producing smooth, slowly
-        varying pointing errors with the configured RMS.
+        Return a NEW camera state with atmospheric turbulence offset applied
+        (never mutates the input camera). Uses an Ornstein-Uhlenbeck filter:
+        each call advances the internal filtered angular offset by one timestep,
+        producing smooth, slowly varying pointing errors with the configured RMS.
         """
         # Step size: use a fixed internal dt derived from the correlation time
         # to keep the process stable regardless of frame rate.
@@ -391,9 +433,12 @@ class AtmosphericTurbulence:
         self._offset_az = decay * self._offset_az + self.rng.normal(0.0, noise_std)
         self._offset_el = decay * self._offset_el + self.rng.normal(0.0, noise_std)
 
-        cam.pan_deg += self._offset_az
-        cam.tilt_deg += self._offset_el
-        return cam
+        return CameraState(
+            pan_deg=cam.pan_deg + self._offset_az,
+            tilt_deg=cam.tilt_deg + self._offset_el,
+            width=cam.width, height=cam.height,
+            h_fov_deg=cam.h_fov_deg, v_fov_deg=cam.v_fov_deg,
+        )
 
 
 class ExposureVariation:
@@ -545,12 +590,25 @@ class FrameRenderer:
                  beacon_sigma_px: float = 4.0,
                  beacon_peak_intensity: float = 255.0,
                  background_top: int = 40,
-                 background_bottom: int = 10):
+                 background_bottom: int = 10,
+                 stars_enabled: bool = False,
+                 star_count: int = 50):
         self.cam = cam
         self.beacon_sigma = beacon_sigma_px
         self.beacon_peak = beacon_peak_intensity
         self.bg_top = background_top      # brightness at top of frame
         self.bg_bottom = background_bottom  # brightness at bottom of frame
+        self.stars_enabled = stars_enabled
+
+        # Pre-compute star positions so they are consistent across frames
+        if stars_enabled:
+            star_rng = np.random.RandomState(seed=42)
+            self._star_positions = [
+                (star_rng.uniform(0, cam.width), star_rng.uniform(0, cam.height))
+                for _ in range(star_count)
+            ]
+        else:
+            self._star_positions = []
 
     def render_background(self) -> np.ndarray:
         """Create a vertical brightness gradient (sky-like)."""
@@ -602,6 +660,12 @@ class FrameRenderer:
         """
         frame = self.render_background()
 
+        # Draw background stars (behind the beacon)
+        if self.stars_enabled:
+            for sx, sy in self._star_positions:
+                if 0 <= sx < self.cam.width and 0 <= sy < self.cam.height:
+                    cv2.circle(frame, (int(sx), int(sy)), 1, (200, 200, 200), -1)
+
         # Project target into pixel coordinates using the disturbed camera
         px, py = angular_to_pixel(cam_with_disturbances,
                                   target.azimuth_deg, target.elevation_deg)
@@ -633,6 +697,7 @@ class Simulator:
                  beacon_sigma_px: float = 4.0,
                  beacon_peak: float = 255.0,
                  vibration: Optional[PlatformVibration] = None,
+                 turbulence: Optional['AtmosphericTurbulence'] = None,
                  sensor_noise: Optional[SensorNoise] = None,
                  motion_blur: Optional[MotionBlur] = None,
                  initial_target: TargetState = None,
@@ -642,6 +707,7 @@ class Simulator:
         self.target = initial_target or TargetState()
         self.renderer = FrameRenderer(cam, beacon_sigma_px, beacon_peak)
         self.vibration = vibration
+        self.turbulence = turbulence
         self.sensor_noise = sensor_noise
         self.motion_blur = motion_blur
         self.fps = fps
@@ -670,9 +736,11 @@ class Simulator:
             v_fov_deg=self.cam.v_fov_deg,
         )
 
-        # 3. Apply disturbances to camera
+        # 3. Apply camera-level disturbances to copy (never mutate original)
         if self.vibration:
             cam_disturbed = self.vibration.apply(cam_disturbed, self.t)
+        if self.turbulence:
+            cam_disturbed = self.turbulence.apply(cam_disturbed, self.t)
 
         # 4. Render the frame
         frame = self.renderer.render(self.target, cam_disturbed)
@@ -775,6 +843,7 @@ class MultiTargetSimulator:
                  cam: CameraState = CameraState(),
                  beacons: List[BeaconConfig] = None,
                  vibration: Optional[PlatformVibration] = None,
+                 turbulence: Optional[AtmosphericTurbulence] = None,
                  sensor_noise: Optional[SensorNoise] = None,
                  motion_blur: Optional[MotionBlur] = None,
                  fps: float = 30.0):
@@ -784,6 +853,7 @@ class MultiTargetSimulator:
         self.t = 0.0
         self.frame_id = 0
         self.vibration = vibration
+        self.turbulence = turbulence
         self.sensor_noise = sensor_noise
         self.motion_blur = motion_blur
 
@@ -829,9 +899,11 @@ class MultiTargetSimulator:
             v_fov_deg=self.cam.v_fov_deg,
         )
 
-        # 3. Apply camera disturbances
+        # 3. Apply camera disturbances to copy (never mutate original)
         if self.vibration:
             cam_disturbed = self.vibration.apply(cam_disturbed, self.t)
+        if self.turbulence:
+            cam_disturbed = self.turbulence.apply(cam_disturbed, self.t)
 
         # 4. Render the frame with all visible beacons
         frame = self._renderers[self._beacon_configs[0].id].render_background()
@@ -1023,12 +1095,14 @@ def _test_rendering():
             print(f"  Frame {i}: target at ({gt.target_pixel_x:.1f}, {gt.target_pixel_y:.1f}), visible={gt.target_visible}")
 
     # Save a video for visual inspection
+    import tempfile
+    video_path = os.path.join(tempfile.gettempdir(), 'sim_test.mp4')
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter('/scratch/work/sim_test.mp4', fourcc, 30, (cam.width, cam.height))
+    out = cv2.VideoWriter(video_path, fourcc, 30, (cam.width, cam.height))
     for f in frames:
         out.write(f)
     out.release()
-    print("  Saved 90-frame test video to /scratch/work/sim_test.mp4")
+    print(f"  Saved 90-frame test video to {video_path}")
     print("Rendering test passed.\n")
 
 

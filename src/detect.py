@@ -35,6 +35,7 @@ class Detection:
     area: float = 0.0       # blob area (pixels²)
     bbox: tuple = (0, 0, 0, 0)  # (x, y, w, h)
     confidence: float = 0.0  # 0–1, based on brightness vs threshold
+    beacon_id: str = ""      # beacon identity
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -61,15 +62,22 @@ class DetectorBase(ABC):
 # Beacon detector — classical brightness + connected components
 # ──────────────────────────────────────────────────────────────────────────
 
+def _aspect_ratio(bbox: tuple) -> float:
+    """Return the aspect ratio (max(w,h)/min(w,h)) of a (x, y, w, h) bounding box."""
+    x, y, w, h = bbox
+    if w <= 0 or h <= 0:
+        return float('inf')
+    return max(w, h) / min(w, h)
+
+
 class BeaconDetector(DetectorBase):
     """
     Classical beacon detector.
 
     Pipeline: grayscale → adaptive threshold → morphological opening →
-    connected components → filter by area → select brightest centroid.
+    connected components → filter by area → shape filter → select brightest centroid.
 
-    Works for white/bright beacons against a darker background.
-    For colored beacons, add HSV filtering before this pipeline.
+    Optionally applies HSV color filtering before the threshold step.
     """
 
     def __init__(self,
@@ -79,7 +87,12 @@ class BeaconDetector(DetectorBase):
                  min_area: int = 2,
                  max_area: int = 500,
                  morph_kernel_size: int = 3,
-                 morph_iterations: int = 1):
+                 morph_iterations: int = 1,
+                 use_hsv: bool = False,
+                 hsv_low: tuple = (0, 0, 150),
+                 hsv_high: tuple = (180, 255, 255),
+                 max_aspect_ratio: float = 3.0,
+                 persistence_threshold: int = 0):
         self.threshold_method = threshold_method
         self.fixed_threshold = fixed_threshold
         self.otsu_min_threshold = otsu_min_threshold
@@ -89,6 +102,15 @@ class BeaconDetector(DetectorBase):
             cv2.MORPH_ELLIPSE, (morph_kernel_size, morph_kernel_size))
         self.morph_iterations = morph_iterations
         self._last_threshold = 0
+        # HSV color filtering
+        self.use_hsv = use_hsv
+        self.hsv_low = hsv_low
+        self.hsv_high = hsv_high
+        # Shape filtering
+        self.max_aspect_ratio = max_aspect_ratio
+        # Persistence filtering
+        self.persistence_threshold = persistence_threshold
+        self._previous_centroids: dict = {}  # {(cx_bin, cy_bin): consecutive_count}
 
     def detect(self, frame: np.ndarray) -> Detection:
         """
@@ -121,10 +143,21 @@ class BeaconDetector(DetectorBase):
                 gray, self.fixed_threshold, 255, cv2.THRESH_BINARY)
             self._last_threshold = self.fixed_threshold
 
+        # 2b. Optional HSV color filtering (AND with grayscale mask)
+        if self.use_hsv:
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            hsv_mask = cv2.inRange(hsv, np.array(self.hsv_low), np.array(self.hsv_high))
+            binary = cv2.bitwise_and(binary, hsv_mask)
+
         # 3. Morphological opening (remove small noise speckles)
         binary = cv2.morphologyEx(
             binary, cv2.MORPH_OPEN, self.morph_kernel,
             iterations=self.morph_iterations)
+
+        # Morphological closing: fill small holes in detected blobs (PRD FR-DE2)
+        binary = cv2.morphologyEx(
+            binary, cv2.MORPH_CLOSE, self.morph_kernel,
+            iterations=1)
 
         # 4. Connected components
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
@@ -132,12 +165,11 @@ class BeaconDetector(DetectorBase):
 
         if num_labels <= 1:
             # Only background label (0); no candidates
+            self._previous_centroids = {}
             return Detection()
 
-        # 5. Filter by area and select the best candidate
-        best_detection = Detection()
-        best_brightness = 0
-
+        # 5. Build candidate list with area and shape filtering
+        candidates = []
         for i in range(1, num_labels):  # skip label 0 (background)
             area = stats[i, cv2.CC_STAT_AREA]
             if area < self.min_area or area > self.max_area:
@@ -162,7 +194,21 @@ class BeaconDetector(DetectorBase):
             else:
                 confidence = min(1.0, mean / 100.0)
 
-            # Select the brightest candidate (highest peak)
+            candidates.append((cx, cy, area, (int(x), int(y), int(w), int(h)), peak, confidence))
+
+        # Shape filter: reject elongated blobs
+        if self.max_aspect_ratio and self.max_aspect_ratio > 0:
+            candidates = [(cx, cy, area, bbox, peak, conf) for cx, cy, area, bbox, peak, conf in candidates
+                          if _aspect_ratio(bbox) <= self.max_aspect_ratio]
+
+        if not candidates:
+            self._previous_centroids = {}
+            return Detection()
+
+        # 6. Select the brightest candidate
+        best_detection = Detection()
+        best_brightness = -1
+        for cx, cy, area, bbox, peak, conf in candidates:
             if peak > best_brightness:
                 best_brightness = peak
                 best_detection = Detection(
@@ -170,9 +216,35 @@ class BeaconDetector(DetectorBase):
                     cx=float(cx),
                     cy=float(cy),
                     area=float(area),
-                    bbox=(int(x), int(y), int(w), int(h)),
-                    confidence=float(confidence),
+                    bbox=bbox,
+                    confidence=float(conf),
                 )
+
+        # 7. Persistence filtering: reject candidates not seen in recent frames
+        if self.persistence_threshold > 0 and best_detection.detected:
+            # Bin the centroid to a coarse grid to match across frames
+            bin_size = 10.0
+            bin_key = (int(best_detection.cx / bin_size),
+                       int(best_detection.cy / bin_size))
+
+            # Update all bin counts: decay existing, boost the matched one
+            new_counts = {}
+            for key, count in self._previous_centroids.items():
+                new_counts[key] = count - 1  # decay
+
+            if bin_key in new_counts:
+                new_counts[bin_key] = new_counts[bin_key] + 2  # boost
+            else:
+                new_counts[bin_key] = 1
+
+            # Remove zero/negative entries
+            self._previous_centroids = {k: v for k, v in new_counts.items() if v > 0}
+
+            # Check persistence
+            if new_counts.get(bin_key, 0) < self.persistence_threshold:
+                best_detection.detected = False
+        else:
+            self._previous_centroids = {}
 
         return best_detection
 
@@ -230,6 +302,22 @@ class AlphaBetaFilter:
         self.vx = 0.0
         self.vy = 0.0
         self._initialized = False
+
+    def get_position(self) -> tuple[float, float]:
+        """Return the current estimated position."""
+        return (float(self.x), float(self.y))
+
+    def get_velocity(self) -> tuple[float, float]:
+        """Return the current estimated velocity."""
+        return (float(self.vx), float(self.vy))
+
+    def initialize(self, x: float, y: float) -> None:
+        """Initialize filter at given position."""
+        self.x = float(x)
+        self.y = float(y)
+        self.vx = 0.0
+        self.vy = 0.0
+        self._initialized = True
 
     @property
     def position(self) -> tuple[float, float]:
@@ -380,6 +468,7 @@ class TrackerOutput:
     detected: bool        # Whether the detector found the beacon this frame
     consecutive_detections: int  # Running count for acquisition logic
     consecutive_misses: int      # Running count for loss detection
+    tracked_id: str = ""         # identity of the tracked beacon
 
 
 class Tracker:
@@ -416,6 +505,7 @@ class Tracker:
                  image_height: int = 720):
         self.detector = detector or BeaconDetector()
         self.kalman = kalman or KalmanFilter2D()
+        self.filter = self.kalman
         self.acquire_threshold = acquire_threshold
         self.verify_threshold = verify_threshold
         self.acquire_error_threshold = acquire_error_threshold
@@ -445,8 +535,9 @@ class Tracker:
         Returns:
             TrackerOutput with state, estimated position, and confidence.
         """
-        # IDLE: no-op, return current estimate
+        # IDLE: predict only (no detection, covariance grows)
         if self.state == TrackerState.IDLE:
+            self.kalman.predict()
             est_x, est_y = self.kalman.get_position()
             return TrackerOutput(
                 state=self.state,
@@ -458,8 +549,9 @@ class Tracker:
                 consecutive_misses=self.consecutive_misses,
             )
 
-        # FAILED: no-op, return current estimate
+        # FAILED: predict only (no detection, covariance grows)
         if self.state == TrackerState.FAILED:
+            self.kalman.predict()
             est_x, est_y = self.kalman.get_position()
             return TrackerOutput(
                 state=self.state,
@@ -524,8 +616,12 @@ class Tracker:
                     self.state = TrackerState.ACQUIRING
                     self.consecutive_detections = 0
             else:
-                self.state = TrackerState.SEARCHING
-                self.consecutive_detections = 0
+                # Allow 1 missed frame before reverting (noise tolerance)
+                self.consecutive_misses += 1
+                if self.consecutive_misses > 1:
+                    self.state = TrackerState.SEARCHING
+                    self.consecutive_detections = 0
+                    self.consecutive_misses = 0
 
         elif self.state == TrackerState.ACQUIRING:
             if detected and self.consecutive_detections >= self.acquire_threshold:
@@ -551,9 +647,15 @@ class Tracker:
 
         elif self.state == TrackerState.REACQUIRING:
             if detected:
-                self.state = TrackerState.TRACKING
-                self.reacquire_counter = 0
+                # consecutive_detections already incremented in track()
+                # Require verify_threshold consecutive detections before
+                # returning to TRACKING (prevents single-frame false lock)
+                if self.consecutive_detections >= self.verify_threshold:
+                    self.state = TrackerState.TRACKING
+                    self.reacquire_counter = 0
+                    self.consecutive_misses = 0
             else:
+                self.consecutive_detections = 0
                 self.reacquire_counter += 1
                 if self.reacquire_counter >= self.reacquire_timeout:
                     self.state = TrackerState.SEARCHING

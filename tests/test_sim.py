@@ -262,15 +262,14 @@ class TestDisturbances:
         assert abs(cam1.tilt_deg - cam2.tilt_deg) < 1e-12
 
     def test_vibration_different_seeds_differ(self):
-        cam1 = CameraState(pan_deg=0.0, tilt_deg=0.0)
-        cam2 = CameraState(pan_deg=0.0, tilt_deg=0.0)
+        cam = CameraState(pan_deg=0.0, tilt_deg=0.0)
         vib1 = PlatformVibration(rms_deg=0.2, seed=1)
         vib2 = PlatformVibration(rms_deg=0.2, seed=2)
 
-        vib1.apply(cam1, t=1.0)
-        vib2.apply(cam2, t=1.0)
+        result1 = vib1.apply(cam, t=1.0)
+        result2 = vib2.apply(cam, t=1.0)
         # At least one axis should differ
-        assert cam1.pan_deg != cam2.pan_deg or cam1.tilt_deg != cam2.tilt_deg
+        assert result1.pan_deg != result2.pan_deg or result1.tilt_deg != result2.tilt_deg
 
     def test_sensor_noise_statistics(self):
         """SensorNoise should add zero-mean noise with approximately the expected sigma."""
@@ -291,14 +290,13 @@ class TestDisturbances:
         assert not np.array_equal(frame1, frame2)
 
     def test_vibration_different_times_differ(self):
-        cam1 = CameraState(pan_deg=0.0, tilt_deg=0.0)
-        cam2 = CameraState(pan_deg=0.0, tilt_deg=0.0)
+        cam = CameraState(pan_deg=0.0, tilt_deg=0.0)
         vib = PlatformVibration(rms_deg=0.5, seed=42)
 
-        vib.apply(cam1, t=0.0)
-        vib.apply(cam2, t=1.0)
+        result0 = vib.apply(cam, t=0.0)
+        result1 = vib.apply(cam, t=1.0)
         # Different times should produce different offsets (the sinusoidal component differs)
-        assert cam1.pan_deg != cam2.pan_deg or cam1.tilt_deg != cam2.tilt_deg
+        assert result0.pan_deg != result1.pan_deg or result0.tilt_deg != result1.tilt_deg
 
 
 # ---------------------------------------------------------------------------

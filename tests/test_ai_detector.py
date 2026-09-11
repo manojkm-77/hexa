@@ -137,8 +137,9 @@ class TestAIDetectorMockSession:
     def test_detects_beacon_from_mock_output(self):
         # Mock output: one detection at roughly center of 64x64 input
         # In 64x64 space: box from (20,20) to (40,40), confidence 0.95
+        # Output is normalized, so 20/64 = 0.3125, 40/64 = 0.625
         detections = np.array([[
-            [20.0, 20.0, 40.0, 40.0, 0.95, 0.0]
+            0.95, 0.3125, 0.3125, 0.625, 0.625
         ]], dtype=np.float32)
         mock_session = _MockSession(detections)
 
@@ -160,7 +161,7 @@ class TestAIDetectorMockSession:
     def test_ignores_low_confidence_detections(self):
         # Detection below threshold
         detections = np.array([[
-            [20.0, 20.0, 40.0, 40.0, 0.2, 0.0]
+            0.2, 20.0, 20.0, 40.0, 40.0
         ]], dtype=np.float32)
         mock_session = _MockSession(detections)
 
@@ -175,8 +176,7 @@ class TestAIDetectorMockSession:
     def test_picks_highest_confidence_detection(self):
         # Two detections: low and high confidence
         detections = np.array([[
-            [5.0, 5.0, 15.0, 15.0, 0.3, 0.0],
-            [25.0, 25.0, 45.0, 45.0, 0.9, 0.0],
+            0.9, 25.0, 25.0, 45.0, 45.0
         ]], dtype=np.float32)
         mock_session = _MockSession(detections)
 
@@ -190,7 +190,7 @@ class TestAIDetectorMockSession:
         assert result.confidence >= 0.899
 
     def test_empty_detections_returns_no_detection(self):
-        detections = np.zeros((1, 0, 6), dtype=np.float32)
+        detections = np.zeros((1, 5), dtype=np.float32)
         mock_session = _MockSession(detections)
 
         detector = AIDetector(model_path=None, confidence_threshold=0.5)
@@ -210,12 +210,12 @@ class TestAIDetectorPreprocessing:
 
         class CapturingSession:
             def __init__(self):
-                self._input = _MockInput([1, 3, 48, 64])
+                self._input = _MockInput([1, 1, 48, 64])
             def get_inputs(self):
                 return [self._input]
             def run(self, output_names, input_feed):
                 captured_inputs.update(input_feed)
-                return [np.zeros((1, 0, 6), dtype=np.float32)]
+                return [np.zeros((1, 5), dtype=np.float32)]
 
         detector = AIDetector(model_path=None)
         detector.session = CapturingSession()
@@ -224,7 +224,7 @@ class TestAIDetectorPreprocessing:
         detector.detect(frame)
 
         blob = captured_inputs["input"]
-        assert blob.shape == (1, 3, 48, 64)
+        assert blob.shape == (1, 1, 48, 64)
         assert blob.dtype == np.float32
         assert blob.min() >= 0.0
         assert blob.max() <= 1.0

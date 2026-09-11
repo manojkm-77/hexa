@@ -16,6 +16,7 @@ Dependencies: numpy, cv2, matplotlib
 """
 
 import sys
+import argparse
 import numpy as np
 import cv2
 import csv
@@ -35,81 +36,127 @@ from sim import (Simulator, CameraState, TargetState,
                  PlatformVibration, SensorNoise, MotionBlur,
                  GroundTruth,
                  AtmosphericTurbulence, ExposureVariation, Occlusion, FalseBeacons)
-from detect import BeaconDetector, KalmanFilter2D, Tracker, TrackerState
-from control import IntegratedController, ControllerOutput
+from detect import (BeaconDetector, KalmanFilter2D, AlphaBetaFilter,
+                    Tracker, TrackerState, MultiTracker)
+from control import IntegratedController, ControllerOutput, SearchPattern
 from report import SummaryReporter, ReportGenerator
+
+# Conditional imports for optional features
+try:
+    from ai_detector import AIDetector
+except ImportError:
+    AIDetector = None
+
+try:
+    from sim import MultiTargetSimulator, BeaconConfig
+except ImportError:
+    MultiTargetSimulator = None
+    BeaconConfig = None
 
 
 # ──────────────────────────────────────────────────────────────────────────
 # Scenario definitions
 # ──────────────────────────────────────────────────────────────────────────
 
-def make_scenario(config: Config, scenario_name: str):
-    """Create a simulator and controller for a named scenario.
-
-    Returns
-    -------
-    tuple
-        (sim, controller, disturbances) where disturbances is a dict of
-        v1.1 disturbance objects (may contain None values when the
-        corresponding config parameter is zero).
-    """
-    cam = CameraState(
-        pan_deg=0.0, tilt_deg=0.0,
-        width=config.width, height=config.height,
-        h_fov_deg=config.h_fov_deg, v_fov_deg=config.v_fov_deg,
-    )
+def _build_motion_model(config: Config, scenario_name: str):
+    """Build a motion model from config based on scenario type."""
+    seed = config.random_seed
 
     if scenario_name == "clean":
-        motion = CircularMotion(
+        motion_type = config.clean_motion
+    elif scenario_name == "hard":
+        motion_type = config.hard_motion
+    else:
+        raise ValueError(f"Unknown scenario: {scenario_name}")
+
+    if motion_type == "circular":
+        return CircularMotion(
             center_az_deg=config.clean_center_az,
             center_el_deg=config.clean_center_el,
             radius_deg=config.clean_radius,
             angular_speed_deg_s=config.clean_speed,
         )
-        vibration = None
-        noise = None
-        blur = None
-
-    elif scenario_name == "hard":
-        motion = SinusoidalMotion(
+    elif motion_type == "sinusoidal":
+        return SinusoidalMotion(
             az_amp_deg=config.hard_az_amp,
             az_freq_hz=config.hard_az_freq,
             el_amp_deg=config.hard_el_amp,
             el_freq_hz=config.hard_el_freq,
         )
-        vibration = PlatformVibration(
-            rms_deg=config.hard_vibration_rms, seed=config.random_seed)
-        noise = SensorNoise(
-            sigma=config.hard_noise_sigma, seed=config.random_seed + 1)
-        blur = MotionBlur(max_blur_pixels=config.hard_blur_pixels)
+    elif motion_type == "constant":
+        return ConstantVelocity(
+            az_rate_deg_s=config.clean_az_rate,
+            el_rate_deg_s=config.clean_el_rate,
+        )
+    elif motion_type == "random":
+        return RandomManeuvering(
+            max_acc_deg_s2=config.clean_max_acc,
+            change_interval_s=config.clean_change_interval,
+            max_vel_deg_s=config.clean_max_vel,
+            seed=seed,
+        )
+    else:
+        raise ValueError(f"Unknown motion type: {motion_type}")
 
+
+def _build_disturbances(config: Config, scenario_name: str):
+    """Build v1.1 disturbance objects from config.
+
+    Returns (vibration, noise, blur, disturbances_dict) where the first
+    three are the Simulator-level disturbances and disturbances_dict holds
+    the v1.1 disturbances applied in the run loop.
+    """
+    seed = config.random_seed
+
+    # Select scenario-specific disturbance parameters
+    if scenario_name == "clean":
+        vib_rms = config.clean_vibration_rms
+        noise_sigma = config.clean_noise_sigma
+        blur_px = config.clean_blur_pixels
+        turb_rms = config.turbulence_rms_deg
+        exp_rate = config.exposure_rate_hz
+        occ_dur = config.occlusion_duration_s
+        fb_count = config.false_beacon_count
+    elif scenario_name == "hard":
+        vib_rms = config.hard_vibration_rms
+        noise_sigma = config.hard_noise_sigma
+        blur_px = config.hard_blur_pixels
+        turb_rms = config.hard_turbulence_rms_deg
+        exp_rate = config.hard_exposure_rate_hz
+        occ_dur = config.hard_occlusion_duration_s
+        fb_count = config.hard_false_beacon_count
     else:
         raise ValueError(f"Unknown scenario: {scenario_name}")
 
+    vibration = PlatformVibration(
+        rms_deg=vib_rms, seed=seed) if vib_rms > 0 else None
+    noise = SensorNoise(
+        sigma=noise_sigma, seed=seed + 1) if noise_sigma > 0 else None
+    blur = MotionBlur(max_blur_pixels=blur_px) if blur_px > 0 else None
+
     # v1.1 disturbances
     turbulence = AtmosphericTurbulence(
-        rms_deg=config.turbulence_rms_deg,
+        rms_deg=turb_rms,
         correlation_time_s=config.turbulence_correlation_s,
-        seed=config.random_seed + 2,
-    ) if config.turbulence_rms_deg > 0 else None
+        seed=seed + 2,
+    ) if turb_rms > 0 else None
 
     exposure = ExposureVariation(
-        rate_hz=config.exposure_rate_hz,
+        rate_hz=exp_rate,
         amplitude=config.exposure_amplitude,
-        seed=config.random_seed + 3,
-    ) if config.exposure_amplitude > 0 else None
+        seed=seed + 5,
+    ) if exp_rate > 0 else None
 
     occlusion = Occlusion(
-        duration_s=config.occlusion_duration_s,
+        duration_s=occ_dur,
         frequency_hz=config.occlusion_frequency_hz,
-        seed=config.random_seed + 4,
-    ) if config.occlusion_frequency_hz > 0 else None
+        seed=seed + 3,
+    ) if occ_dur > 0 else None
 
     false_beacons = FalseBeacons(
-        count=config.false_beacon_count,
-        seed=config.random_seed + 5,
-    ) if config.false_beacon_count > 0 else None
+        count=fb_count,
+        seed=seed + 4,
+    ) if fb_count > 0 else None
 
     disturbances = {
         'turbulence': turbulence,
@@ -118,36 +165,133 @@ def make_scenario(config: Config, scenario_name: str):
         'false_beacons': false_beacons,
     }
 
-    sim = Simulator(
-        cam=cam, motion=motion,
-        beacon_sigma_px=config.beacon_sigma_px,
-        beacon_peak=config.beacon_peak,
-        vibration=vibration, sensor_noise=noise, motion_blur=blur,
-        fps=config.fps,
+    return vibration, noise, blur, disturbances
+
+
+def _build_detector(config: Config):
+    """Build the detection component based on config.detector_type."""
+    classical_det = BeaconDetector(
+        fixed_threshold=config.threshold,
+        min_area=config.min_area,
+        max_area=config.max_area,
     )
 
-    tracker = Tracker(
-        detector=BeaconDetector(
-            fixed_threshold=config.threshold,
-            min_area=config.min_area, max_area=config.max_area,
-        ),
-        kalman=KalmanFilter2D(measurement_noise=config.measurement_noise),
-        acquire_threshold=config.acquire_threshold,
-        lose_threshold=config.lose_threshold,
-        reacquire_timeout_frames=config.reacquire_timeout,
-        image_width=config.width, image_height=config.height,
+    if config.detector_type == "ai":
+        if AIDetector is None:
+            print("  [Warning] AIDetector not available, falling back to classical")
+            return classical_det
+        return AIDetector(
+            model_path=config.ai_model_path or None,
+            fallback=classical_det,
+        )
+    return classical_det
+
+
+def _build_filter(config: Config):
+    """Build the state estimation filter based on config.filter_type."""
+    if config.filter_type == "alpha_beta":
+        return AlphaBetaFilter(
+            alpha=config.alpha,
+            beta=config.beta,
+            dt=1.0 / config.fps,
+        )
+    return KalmanFilter2D(measurement_noise=config.measurement_noise)
+
+
+def make_scenario(config: Config, scenario_name: str):
+    """Create a simulator and controller for a named scenario.
+
+    Returns
+    -------
+    tuple
+        (sim, controller, disturbances, multi_tracker_or_None) where
+        disturbances is a dict of v1.1 disturbance objects (may contain
+        None values when the corresponding config parameter is zero), and
+        multi_tracker_or_None is a MultiTracker when multi_target mode is
+        enabled (None otherwise).
+    """
+    cam = CameraState(
+        pan_deg=0.0, tilt_deg=0.0,
+        width=config.width, height=config.height,
+        h_fov_deg=config.h_fov_deg, v_fov_deg=config.v_fov_deg,
     )
 
-    controller = IntegratedController(
-        cam=cam, tracker=tracker,
-        kp=config.kp, ki=config.ki, kd=config.kd,
-        dt=1.0 / config.fps,
-        pan_range=config.pan_range, tilt_range=config.tilt_range,
-        rate_limit_deg_s=config.rate_limit_deg_s,
-        deadband_pixels=config.deadband_pixels,
-    )
+    motion = _build_motion_model(config, scenario_name)
+    vibration, noise, blur, disturbances = _build_disturbances(config, scenario_name)
+    detector = _build_detector(config)
+    kalman = _build_filter(config)
 
-    return sim, controller, disturbances
+    multi_tracker = None
+
+    if config.multi_target and MultiTargetSimulator is not None:
+        # Multi-target mode: create MultiTargetSimulator + MultiTracker
+        colors = config.target_colors
+        beacons = [
+            BeaconConfig(
+                id=f"b{i}",
+                color=colors[i % len(colors)] if colors else (255, 255, 255),
+            )
+            for i in range(config.num_targets)
+        ]
+        sim = MultiTargetSimulator(
+            cam=cam, beacons=beacons,
+            vibration=vibration,
+            turbulence=disturbances.get('turbulence'),
+            sensor_noise=noise, motion_blur=blur,
+            fps=float(config.fps),
+        )
+        multi_tracker = MultiTracker(
+            beacon_ids=[b.id for b in beacons],
+            detector=detector,
+            acquire_threshold=config.acquire_threshold,
+            lose_threshold=config.lose_threshold,
+            reacquire_timeout_frames=config.reacquire_timeout,
+            image_width=config.width,
+            image_height=config.height,
+        )
+        multi_tracker.start()
+
+        # Wrap in a single-target-compatible controller using first tracker
+        controller = IntegratedController(
+            cam=cam, tracker=list(multi_tracker.trackers.values())[0],
+            kp=config.kp, ki=config.ki, kd=config.kd,
+            dt=1.0 / config.fps,
+            pan_range=config.pan_range, tilt_range=config.tilt_range,
+            rate_limit_deg_s=config.rate_limit_deg_s,
+            deadband_pixels=config.deadband_pixels,
+        )
+    else:
+        # Single-target mode
+        sim = Simulator(
+            cam=cam, motion=motion,
+            beacon_sigma_px=config.beacon_sigma_px,
+            beacon_peak=config.beacon_peak,
+            vibration=vibration,
+            turbulence=disturbances.get('turbulence'),
+            sensor_noise=noise, motion_blur=blur,
+            fps=config.fps,
+        )
+        tracker = Tracker(
+            detector=detector,
+            kalman=kalman,
+            acquire_threshold=config.acquire_threshold,
+            verify_threshold=config.verify_threshold,
+            acquire_error_threshold=config.acquire_error_threshold,
+            lose_threshold=config.lose_threshold,
+            reacquire_timeout_frames=config.reacquire_timeout,
+            image_width=config.width, image_height=config.height,
+        )
+        tracker.start()
+        controller = IntegratedController(
+            cam=cam, tracker=tracker,
+            kp=config.kp, ki=config.ki, kd=config.kd,
+            dt=1.0 / config.fps,
+            pan_range=config.pan_range, tilt_range=config.tilt_range,
+            rate_limit_deg_s=config.rate_limit_deg_s,
+            deadband_pixels=config.deadband_pixels,
+        )
+
+    return sim, controller, disturbances, multi_tracker
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -167,9 +311,9 @@ COLOR_EST = (0, 255, 0)      # green — estimated position
 COLOR_CENTER = (100, 100, 100)  # grey — center crosshair
 
 
-def draw_hud(frame, state, controller_output, gt, tracker, fps, proc_time_ms,
+def draw_hud(frame, state, controller_output, gt, track_output, fps, proc_time_ms,
              dev_mode, config):
-    """Draw HUD overlay on the frame in-place."""
+    """Draw HUD overlay on the frame in-place. track_output is a TrackerOutput."""
     h, w = frame.shape[:2]
 
     # ── Semi-transparent top bar ──
@@ -179,15 +323,19 @@ def draw_hud(frame, state, controller_output, gt, tracker, fps, proc_time_ms,
     cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
 
     # ── State indicator ──
+    state_str = state.value if hasattr(state, "value") else str(state)
     state_colors = {
-        TrackerState.SEARCHING: COLOR_YELLOW,
-        TrackerState.ACQUIRING: COLOR_YELLOW,
-        TrackerState.TRACKING: COLOR_GREEN,
-        TrackerState.REACQUIRING: COLOR_RED,
+        "IDLE": COLOR_TEXT,
+        "SEARCHING": COLOR_YELLOW,
+        "CANDIDATE_VERIFICATION": COLOR_YELLOW,
+        "ACQUIRING": COLOR_BLUE,
+        "TRACKING": COLOR_GREEN,
+        "REACQUIRING": COLOR_RED,
+        "FAILED": COLOR_RED,
     }
-    state_color = state_colors.get(state, COLOR_TEXT)
+    state_color = state_colors.get(state_str, COLOR_TEXT)
     cv2.rectangle(frame, (10, 10), (280, 44), state_color, -1)
-    cv2.putText(frame, f"STATE: {state.value}", (20, 35),
+    cv2.putText(frame, f"STATE: {state_str}", (20, 35),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
 
     # ── Pan / Tilt ──
@@ -211,13 +359,22 @@ def draw_hud(frame, state, controller_output, gt, tracker, fps, proc_time_ms,
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_TEXT, 1, cv2.LINE_AA)
 
     # ── Confidence / detection ──
-    est_x, est_y = tracker.kalman.get_position()
-    det_active = tracker.last_detection is not None and tracker.last_detection.detected
-    conf = tracker.last_detection.confidence if tracker.last_detection else 0.0
+    if track_output is not None:
+        est_x, est_y = track_output.estimated_x, track_output.estimated_y
+        det_active = track_output.detected
+        conf = track_output.confidence
+        det_streak = track_output.consecutive_detections
+        miss_streak = track_output.consecutive_misses
+    else:
+        est_x, est_y = 0.0, 0.0
+        det_active = False
+        conf = 0.0
+        det_streak = 0
+        miss_streak = 0
     det_str = "YES" if det_active else "NO"
     cv2.putText(frame, f"DET: {det_str}  CONF: {conf:.2f}", (1050, 25),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_TEXT, 1, cv2.LINE_AA)
-    cv2.putText(frame, f"DET_STREAK: {tracker.consecutive_detections}  MISS: {tracker.consecutive_misses}",
+    cv2.putText(frame, f"DET_STREAK: {det_streak}  MISS: {miss_streak}",
                 (1050, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_TEXT, 1, cv2.LINE_AA)
 
     # ── Lock indicator (green border when tracking) ──
@@ -243,9 +400,12 @@ def draw_hud(frame, state, controller_output, gt, tracker, fps, proc_time_ms,
         cv2.circle(frame, (int(est_x), int(est_y)), 2, COLOR_EST, -1)
 
     # ── Ground truth (dev mode only — red cross) ──
-    if dev_mode and gt.target_visible:
-        gtx, gty = int(gt.target_pixel_x), int(gt.target_pixel_y)
-        cv2.drawMarker(frame, (gtx, gty), COLOR_GT, cv2.MARKER_CROSS, 20, 2)
+    if dev_mode and gt is not None:
+        gt_list = gt if isinstance(gt, (list, tuple)) else [gt]
+        for g in gt_list:
+            if hasattr(g, 'target_visible') and g.target_visible:
+                gtx, gty = int(g.target_pixel_x), int(g.target_pixel_y)
+                cv2.drawMarker(frame, (gtx, gty), COLOR_GT, cv2.MARKER_CROSS, 20, 2)
 
     # ── Bottom bar: scenario + controls ──
     bot_h = 30
@@ -287,15 +447,22 @@ class CSVLogger:
         self._file.write(f"# run_id={run_id}\n# seed={seed}\n# timestamp={datetime.now().isoformat()}\n")
         self._writer.writeheader()
 
-    def log(self, frame_id, timestamp, fps, gt, tracker, controller_output,
+    def log(self, frame_id, timestamp, fps, gt, track_output, controller_output,
             proc_time_ms):
-        """Log one frame."""
-        est_x, est_y = tracker.kalman.get_position()
+        """Log one frame. track_output is a TrackerOutput (or None)."""
+        if track_output is not None:
+            est_x = track_output.estimated_x
+            est_y = track_output.estimated_y
+            det_active = track_output.detected
+            conf = track_output.confidence
+            tracker_state = track_output.state.value
+        else:
+            est_x, est_y = 0.0, 0.0
+            det_active = False
+            conf = 0.0
+            tracker_state = 'IDLE'
         angular_err = np.sqrt(controller_output.error_pan_deg**2 +
                               controller_output.error_tilt_deg**2)
-        det_active = (tracker.last_detection is not None and
-                      tracker.last_detection.detected)
-        conf = tracker.last_detection.confidence if tracker.last_detection else 0.0
 
         row = {
             'run_id': self.run_id,
@@ -311,7 +478,7 @@ class CSVLogger:
             'angular_error_deg': f"{angular_err:.4f}",
             'detection_confidence': f"{conf:.4f}",
             'detected': int(det_active),
-            'tracker_state': tracker.state.value,
+            'tracker_state': tracker_state,
             'pan_cmd': f"{controller_output.pan_cmd_deg:.4f}",
             'tilt_cmd': f"{controller_output.tilt_cmd_deg:.4f}",
             'pan_actual': f"{gt.camera_pan_deg:.4f}",
@@ -352,17 +519,28 @@ class CSVLogger:
             if states[i-1] == 'TRACKING' and states[i] == 'REACQUIRING':
                 losses += 1
 
+        # Use actual FPS from data (not hardcoded 30.0)
+        nominal_fps = float(fps_vals[0]) if fps_vals else 30.0
+        if nominal_fps <= 0:
+            nominal_fps = 30.0
+
+        # Steady-state error: mean error over last 20% of frames
+        ss_start = int(len(errors) * 0.8)
+        ss_errors = errors[ss_start:] if ss_start < len(errors) else errors
+        steady_state_error = float(np.mean(ss_errors)) if ss_errors else 0.0
+
         return {
-            'duration_s': len(self.rows) / 30.0,
+            'duration_s': len(self.rows) / nominal_fps,
             'num_frames': len(self.rows),
             'mean_fps': np.mean(fps_vals),
             'min_fps': np.min(fps_vals),
             'mean_proc_ms': np.mean(proc_times),
             'max_proc_ms': np.max(proc_times),
-            'acquisition_time_s': acq_frames / 30.0 if acq_frames else None,
+            'acquisition_time_s': acq_frames / nominal_fps if acq_frames else None,
             'detection_rate': np.mean(detected),
             'mean_error_px': np.mean(errors),
             'max_error_px': np.max(errors),
+            'steady_state_error_px': steady_state_error,
             'rms_angular_error_deg': np.sqrt(np.mean(np.square(ang_errors))),
             'lock_retention_pct': tracking_count / len(self.rows) * 100,
             'num_losses': losses,
@@ -440,7 +618,7 @@ def run_scenario(scenario_name, config, output_dir, headless=False):
     print(f"  Scenario: {scenario_name.upper()}")
     print(f"{'='*60}")
 
-    sim, controller, disturbances = make_scenario(config, scenario_name)
+    sim, controller, disturbances, multi_tracker = make_scenario(config, scenario_name)
     num_frames = int(config.duration_s * config.fps)
 
     run_id = f"{scenario_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -472,29 +650,55 @@ def run_scenario(scenario_name, config, output_dir, headless=False):
         t0 = time.time()
 
         if not paused:
-            # ── Apply v1.1 camera-level disturbances before rendering ──
-            if disturbances.get('turbulence'):
-                disturbances['turbulence'].apply(sim.cam, sim.t)
-
             # ── The main loop ──
+            # Camera-level disturbances (vibration, turbulence) are now applied
+            # inside sim.step() on a copy of the camera state (never on sim.cam).
             frame, gt = sim.step(frame_id)
+            gt_primary = gt[0] if isinstance(gt, (list, tuple)) else gt
+            ts = gt_primary.timestamp if hasattr(gt_primary, 'timestamp') else (frame_id / config.fps)
 
             # ── Apply v1.1 frame-level disturbances after rendering ──
-            if disturbances.get('exposure'):
-                frame = disturbances['exposure'].apply(frame, gt.timestamp)
             if disturbances.get('occlusion'):
-                frame = disturbances['occlusion'].apply(frame, gt.timestamp)
+                frame = disturbances['occlusion'].apply(frame, ts)
             if disturbances.get('false_beacons'):
-                frame = disturbances['false_beacons'].apply(frame, gt.timestamp)
+                frame = disturbances['false_beacons'].apply(frame, ts)
+            if disturbances.get('exposure'):
+                frame = disturbances['exposure'].apply(frame, ts)
 
-            cmd = controller.update(frame, sim.cam.pan_deg, sim.cam.tilt_deg)
+            if multi_tracker is not None:
+                # Multi-target mode: run multi_tracker, then compute camera
+                # commands from the first sub-tracker's output.
+                mt_output = multi_tracker.track(frame)
+                first_bid = multi_tracker.beacon_ids[0]
+                first_tracklet = mt_output.tracklets[first_bid]
+
+                if first_tracklet.state == TrackerState.SEARCHING:
+                    new_pan, new_tilt = controller.search.next_command(
+                        sim.cam.pan_deg, sim.cam.tilt_deg, controller.dt)
+                    cmd = ControllerOutput(
+                        pan_cmd_deg=new_pan, tilt_cmd_deg=new_tilt,
+                        pan_rate_cmd_deg_s=(new_pan - sim.cam.pan_deg) / controller.dt,
+                        tilt_rate_cmd_deg_s=(new_tilt - sim.cam.tilt_deg) / controller.dt,
+                        error_pan_deg=0.0, error_tilt_deg=0.0,
+                        error_pixels=0.0, saturated=False,
+                    )
+                else:
+                    cmd = controller.controller.compute(
+                        first_tracklet.estimated_x, first_tracklet.estimated_y,
+                        sim.cam.pan_deg, sim.cam.tilt_deg)
+
+                # Sync the first sub-tracker's state for HUD display
+                controller.tracker = multi_tracker.trackers[first_bid]
+            else:
+                cmd = controller.update(frame, sim.cam.pan_deg, sim.cam.tilt_deg)
+
             sim.set_camera_pose(cmd.pan_cmd_deg, cmd.tilt_cmd_deg)
 
             proc_time_ms = (time.time() - t0) * 1000
 
             # Log
-            logger.log(frame_id, gt.timestamp, current_fps, gt,
-                       controller.tracker, cmd, proc_time_ms)
+            logger.log(frame_id, ts, current_fps, gt_primary,
+                       controller.last_track_output, cmd, proc_time_ms)
 
             # Print milestones
             if frame_id == 0:
@@ -514,11 +718,14 @@ def run_scenario(scenario_name, config, output_dir, headless=False):
         # ── Save & Display ──
         if not paused:
             save_frame = frame.copy()
-            draw_hud(save_frame, controller.tracker.state, cmd, gt,
-                     controller.tracker, current_fps, proc_time_ms,
+            track_out = controller.last_track_output
+            hud_state = track_out.state if track_out else controller.tracker.state
+            draw_hud(save_frame, hud_state, cmd, gt,
+                     track_out, current_fps, proc_time_ms,
                      dev_mode, config)
-            frame_path = os.path.join(frames_dir, f"frame_{frame_id - 1:05d}.jpg")
-            cv2.imwrite(frame_path, save_frame)
+            if config.save_frames:
+                frame_path = os.path.join(frames_dir, f"frame_{frame_id - 1:05d}.jpg")
+                cv2.imwrite(frame_path, save_frame)
 
         if not headless:
             if paused:
@@ -544,8 +751,9 @@ def run_scenario(scenario_name, config, output_dir, headless=False):
                 logger = CSVLogger(csv_path, run_id, config.random_seed)
                 print("  Reset.")
             elif key == ord('g'):
-                dev_mode = not dev_mode
-                print(f"  Dev mode: {'ON' if dev_mode else 'OFF'}")
+                if not headless:
+                    dev_mode = not dev_mode
+                    print(f"  Dev mode: {'ON' if dev_mode else 'OFF'}")
 
         # FPS calculation
         fps_counter += 1
@@ -612,27 +820,36 @@ def main():
     print("=" * 60)
     print()
 
-    # ── CLI argument parsing ─────────────────────────────────────────
-    scenario_arg = None
-    yaml_path = None
-    for arg in sys.argv[1:]:
-        if arg == '--eval':
-            continue  # handled below
-        if arg.startswith('--scenario='):
-            scenario_arg = arg.split('=', 1)[1]
-        elif arg == '--scenario':
-            idx = sys.argv.index('--scenario')
-            if idx + 1 < len(sys.argv):
-                scenario_arg = sys.argv[idx + 1]
-        elif arg.startswith('--yaml='):
-            yaml_path = arg.split('=', 1)[1]
-        elif arg == '--yaml':
-            idx = sys.argv.index('--yaml')
-            if idx + 1 < len(sys.argv):
-                yaml_path = sys.argv[idx + 1]
+    # ── CLI argument parsing with argparse ───────────────────────────
+    parser = argparse.ArgumentParser(description='FSOC Coarse-Alignment Simulator')
+    parser.add_argument('--scenario', choices=['clean', 'hard'], default='clean',
+                        help='Scenario to run (default: clean)')
+    parser.add_argument('--yaml', type=str, default=None,
+                        help='Path to YAML scenario config file')
+    parser.add_argument('--eval', action='store_true',
+                        help='Run evaluation framework (headless)')
+    parser.add_argument('--headless', action='store_true',
+                        help='Run headless (no display)')
+    parser.add_argument('--gui', action='store_true',
+                        help='Launch PySide6 GUI')
+    parser.add_argument('--multi-target', action='store_true',
+                        help='Run multi-target scenario')
+    parser.add_argument('--detector', choices=['classical', 'ai'], default=None,
+                        help='Detector type (overrides config)')
+    parser.add_argument('--filter', choices=['kalman', 'alpha_beta'], default=None,
+                        help='Filter type (overrides config)')
+    parser.add_argument('--model', type=str, default='',
+                        help='Path to ONNX model for AI detector')
+    parser.add_argument('--output', type=str, default='results',
+                        help='Output directory (default: results)')
+    parser.add_argument('--duration', type=int, default=None,
+                        help='Duration override for eval mode')
+    parser.add_argument('--seeds', type=str, default=None,
+                        help='Comma-separated seeds for eval mode')
+    args = parser.parse_args()
 
     # ── Headless evaluation mode ──────────────────────────────────────
-    if '--eval' in sys.argv:
+    if args.eval:
         from evaluation import (
             run_full_evaluation,
             CATEGORIES,
@@ -645,14 +862,8 @@ def main():
             os.path.dirname(os.path.abspath(__file__)), "..", "results")
         os.makedirs(eval_output, exist_ok=True)
 
-        # Parse optional arguments
-        duration_s = 10
-        seeds = DEFAULT_SEEDS
-        for arg in sys.argv:
-            if arg.startswith('--duration='):
-                duration_s = int(arg.split('=')[1])
-            if arg.startswith('--seeds='):
-                seeds = [int(s) for s in arg.split('=')[1].split(',')]
+        duration_s = args.duration if args.duration is not None else 10
+        seeds = [int(s) for s in args.seeds.split(',')] if args.seeds else DEFAULT_SEEDS
 
         report = run_full_evaluation(
             seeds=seeds,
@@ -680,6 +891,20 @@ def main():
         print(f"\n  Results saved to: {results_path}")
         return
 
+    # ── GUI mode ─────────────────────────────────────────────────────
+    if args.gui:
+        try:
+            from gui.main_window import MainWindow
+            from PySide6.QtWidgets import QApplication
+            app = QApplication(sys.argv)
+            window = MainWindow()
+            window.show()
+            sys.exit(app.exec())
+        except ImportError:
+            print("Error: PySide6 is required for GUI mode.")
+            print("Install with: pip install PySide6")
+            sys.exit(1)
+
     print("  Controls:")
     print("    SPACE — start/pause")
     print("    R     — reset")
@@ -690,36 +915,49 @@ def main():
     print()
 
     # ── Load config from YAML or use defaults ────────────────────────
-    if yaml_path:
+    if args.yaml:
         from yaml_config import load_scenario, scenario_to_config
-        scenario_dict = load_scenario(yaml_path)
+        scenario_dict = load_scenario(args.yaml)
         config = scenario_to_config(scenario_dict)
-        print(f"  Loaded config from: {yaml_path}")
+        print(f"  Loaded config from: {args.yaml}")
     else:
         config = Config()
+
+    # ── Apply CLI overrides to config ────────────────────────────────
+    if args.filter:
+        config.filter_type = args.filter
+    if args.detector:
+        config.detector_type = args.detector
+    if args.model:
+        config.ai_model_path = args.model
+    if args.multi_target:
+        config.multi_target = True
+    if args.duration is not None:
+        config.duration_s = args.duration
 
     # Shorten duration for testing; restore to 60 for the real demo
     if os.environ.get('FSOC_TEST_MODE', '0') == '1':
         config.duration_s = 10
-    output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results")
+
+    output_dir = os.path.abspath(args.output)
     os.makedirs(output_dir, exist_ok=True)
 
-    # Default scenario
-    scenario = scenario_arg or "clean"
+    scenario = args.scenario
 
-    # Check if running headless (no display)
-    headless = False
-    display_val = os.environ.get('DISPLAY', '')
-    if display_val == '' or display_val == 'needs-to-be-defined':
-        headless = True
-    else:
-        try:
-            test = np.zeros((1, 1, 3), dtype=np.uint8)
-            cv2.imshow("test", test)
-            cv2.waitKey(1)
-            cv2.destroyWindow("test")
-        except Exception:
+    # ── Headless detection ────────────────────────────────────────────
+    headless = args.headless
+    if not headless:
+        display_val = os.environ.get('DISPLAY', '')
+        if display_val == '' or display_val == 'needs-to-be-defined':
             headless = True
+        else:
+            try:
+                test = np.zeros((1, 1, 3), dtype=np.uint8)
+                cv2.imshow("test", test)
+                cv2.waitKey(1)
+                cv2.destroyWindow("test")
+            except Exception:
+                headless = True
 
     if headless:
         print("  [Headless mode - no display available]")
@@ -727,8 +965,8 @@ def main():
 
     if headless:
         # If a specific scenario was requested, only run that one
-        if scenario_arg:
-            scenarios_to_run = [scenario_arg]
+        if args.scenario:
+            scenarios_to_run = [args.scenario]
         else:
             scenarios_to_run = ["clean", "hard"]
 

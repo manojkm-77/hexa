@@ -346,7 +346,7 @@ class ScenarioRunner:
         from main import CSVLogger
 
         cfg = _SCENARIO_CONFIGS[scenario_name]
-        sim, controller = _build_simulator(cfg, seed, self.fps)
+        sim, controller, disturbances = _build_simulator(cfg, seed, self.fps)
         num_frames = int(duration_s * self.fps)
 
         run_id = f"eval_{scenario_name}_s{seed}"
@@ -360,12 +360,21 @@ class ScenarioRunner:
         for frame_id in range(num_frames):
             t0 = time.time()
             frame, gt = sim.step(frame_id)
+
+            # Apply v1.1 frame-level disturbances (turbulence is now inside step())
+            if disturbances.get('occlusion'):
+                frame = disturbances['occlusion'].apply(frame, sim.t)
+            if disturbances.get('false_beacons'):
+                frame = disturbances['false_beacons'].apply(frame, sim.t)
+            if disturbances.get('exposure'):
+                frame = disturbances['exposure'].apply(frame, sim.t)
+
             cmd = controller.update(frame, sim.cam.pan_deg, sim.cam.tilt_deg)
             sim.set_camera_pose(cmd.pan_cmd_deg, cmd.tilt_cmd_deg)
             proc_time_ms = (time.time() - t0) * 1000
 
             logger.log(frame_id, gt.timestamp, current_fps, gt,
-                       controller.tracker, cmd, proc_time_ms)
+                       controller.last_track_output, cmd, proc_time_ms)
 
             fps_counter += 1
             elapsed = time.time() - fps_timer
@@ -432,44 +441,35 @@ def _build_simulator(cfg: dict, seed: int, fps: int = 30) -> tuple:
     motion_blur = (MotionBlur(max_blur_pixels=blur_px)
                    if blur_px > 0 else None)
 
+    # Build turbulence before Simulator so it can be passed as constructor param
+    turb_rms = cfg.get('turbulence_rms', 0.0)
+    turbulence = (AtmosphericTurbulence(rms_deg=turb_rms, seed=seed + 2)
+                  if turb_rms > 0 else None)
+
     sim = Simulator(
         cam=cam, motion=motion,
         beacon_sigma_px=4.0, beacon_peak=255.0,
-        vibration=vibration, sensor_noise=sensor_noise,
+        vibration=vibration, turbulence=turbulence,
+        sensor_noise=sensor_noise,
         motion_blur=motion_blur, fps=float(fps),
     )
 
-    # Attach extra disturbances that need per-frame application
-    turb_rms = cfg.get('turbulence_rms', 0.0)
-    sim._turbulence = (AtmosphericTurbulence(rms_deg=turb_rms, seed=seed + 2)
-                       if turb_rms > 0 else None)
-
-    sim._occlusion = (Occlusion(seed=seed + 3)
-                      if cfg.get('occlusion_enabled', False) else None)
+    occlusion = (Occlusion(seed=seed + 3)
+                 if cfg.get('occlusion_enabled', False) else None)
 
     fb_count = cfg.get('false_beacon_count', 0)
-    sim._false_beacons = (FalseBeacons(count=fb_count, seed=seed + 4)
-                          if fb_count > 0 else None)
+    false_beacons = (FalseBeacons(count=fb_count, seed=seed + 4)
+                     if fb_count > 0 else None)
 
-    sim._exposure = (ExposureVariation(seed=seed + 5)
-                     if cfg.get('exposure_variation', False) else None)
+    exposure = (ExposureVariation(seed=seed + 5)
+                if cfg.get('exposure_variation', False) else None)
 
-    # Patch step() to apply extra disturbances
-    _original_step = sim.step
-
-    def _patched_step(frame_id):
-        frame, gt = _original_step(frame_id)
-        if sim._turbulence is not None:
-            sim._turbulence.apply(cam, sim.t)
-        if sim._occlusion is not None:
-            frame = sim._occlusion.apply(frame, sim.t)
-        if sim._false_beacons is not None:
-            frame = sim._false_beacons.apply(frame, sim.t)
-        if sim._exposure is not None:
-            frame = sim._exposure.apply(frame, sim.t)
-        return frame, gt
-
-    sim.step = _patched_step
+    disturbances = {
+        'turbulence': turbulence,
+        'occlusion': occlusion,
+        'false_beacons': false_beacons,
+        'exposure': exposure,
+    }
 
     # -- Tracker and controller --
     tracker = Tracker(
@@ -481,6 +481,7 @@ def _build_simulator(cfg: dict, seed: int, fps: int = 30) -> tuple:
         reacquire_timeout_frames=150,
         image_width=1280, image_height=720,
     )
+    tracker.start()
     controller = IntegratedController(
         cam=cam, tracker=tracker,
         kp=1.0, ki=0.0, kd=0.15,
@@ -489,7 +490,7 @@ def _build_simulator(cfg: dict, seed: int, fps: int = 30) -> tuple:
         rate_limit_deg_s=60.0, deadband_pixels=3.0,
     )
 
-    return sim, controller
+    return sim, controller, disturbances
 
 
 # ---------------------------------------------------------------------------

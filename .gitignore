@@ -8,3 +8,14 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Output and simulation artifacts
+results/
+training_data/
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+

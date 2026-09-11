@@ -47,29 +47,33 @@ class AIDetector(DetectorBase):
         # Preprocess: resize to model input size
         input_shape = self.session.get_inputs()[0].shape
         h, w = input_shape[2], input_shape[3]
-        resized = cv2.resize(frame, (w, h))
-        blob = resized.astype(np.float32).transpose(2, 0, 1) / 255.0
-        blob = np.expand_dims(blob, axis=0)
+
+        if len(frame.shape) == 3:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = frame
+
+        resized = cv2.resize(gray, (w, h))
+        blob = resized.astype(np.float32) / 255.0
+        blob = np.expand_dims(blob, axis=0) # Channel dim
+        blob = np.expand_dims(blob, axis=0) # Batch dim
 
         # Run inference
         input_name = self.session.get_inputs()[0].name
         outputs = self.session.run(None, {input_name: blob})
 
-        # Parse output — expect [batch, num_detections, 6] = [x1, y1, x2, y2, confidence, class_id]
-        preds = outputs[0][0]  # shape: (num_detections, 6)
+        # Parse output — expect [batch, 5] = [confidence, x1, y1, x2, y2]
+        preds = outputs[0][0]  # shape: (5,)
+        conf = preds[0]
 
-        # Filter by confidence
-        valid = preds[preds[:, 4] >= self.confidence_threshold]
-        if len(valid) == 0:
+        if conf < self.confidence_threshold:
             return Detection()
 
-        # Take highest confidence detection
-        best = valid[np.argmax(valid[:, 4])]
-        x1, y1, x2, y2, conf, cls_id = best
+        x1, y1, x2, y2 = preds[1:5]
 
         # Scale back to original frame size
-        sx = frame.shape[1] / w
-        sy = frame.shape[0] / h
+        sx = frame.shape[1]
+        sy = frame.shape[0]
         x1, x2 = x1 * sx, x2 * sx
         y1, y2 = y1 * sy, y2 * sy
 
@@ -78,7 +82,8 @@ class AIDetector(DetectorBase):
         area = (x2 - x1) * (y2 - y1)
 
         return Detection(
-            detected=True, cx=cx, cy=cy, area=area,
+            detected=True, cx=float(cx), cy=float(cy), area=float(area),
             bbox=(int(x1), int(y1), int(x2 - x1), int(y2 - y1)),
             confidence=float(conf),
+            beacon_id=""
         )

@@ -1,16 +1,31 @@
 [project]
 name = "hexaverse"
-version = "0.1.0"
-description = "Add your description here"
+version = "1.1.0"
+description = "FSOC coarse-alignment simulator — AI-based virtual camera tracking system"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "fastapi>=0.141.1",
     "matplotlib>=3.11.1",
-    "onnxruntime>=1.29.0",
+    "numpy>=1.24",
     "opencv-python>=5.0.0.93",
-    "pydantic>=2.13.5",
-    "pydantic-settings>=2.15.0",
+    "pyyaml>=6.0.3",
+]
+
+[project.optional-dependencies]
+gui = [
+    "PySide6>=6.5",
+    "pyqtgraph>=0.13",
+]
+ai = [
+    "onnxruntime>=1.15",
+    "torch>=2.0",
+]
+full = [
+    "PySide6>=6.5",
+    "onnxruntime>=1.15",
+    "torch>=2.0",
+    "scipy>=1.10",
+    "scikit-learn>=1.3",
 ]
 
 [dependency-groups]

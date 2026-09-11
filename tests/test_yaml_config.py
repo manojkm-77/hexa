@@ -192,7 +192,8 @@ class TestMissingRequiredFields:
         with pytest.raises(ValueError, match="duration_s"):
             load_scenario(str(path))
 
-    def test_missing_controller_section(self, tmp_path):
+    def test_missing_controller_section_uses_defaults(self, tmp_path):
+        """Controller section is optional; Config defaults apply."""
         path = _write_temp_yaml(tmp_path, """
             simulation:
               fps: 30
@@ -219,8 +220,9 @@ class TestMissingRequiredFields:
               lose_threshold: 5
               reacquire_timeout: 150
         """)
-        with pytest.raises(ValueError, match="controller"):
-            load_scenario(str(path))
+        scenario = load_scenario(str(path))
+        config = scenario_to_config(scenario)
+        assert config.kp == 1.0  # Config default
 
     def test_invalid_motion_type(self, tmp_path):
         path = _write_temp_yaml(tmp_path, """

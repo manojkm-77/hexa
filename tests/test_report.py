@@ -306,7 +306,7 @@ class TestReportGenerator:
             content = f.read()
 
         assert "Known Limitations" in content
-        assert "Single-target" in content
+        assert "pinhole lens" in content
 
     def test_html_with_no_config(self, tmp_path):
         csv_path = str(tmp_path / "dummy.csv")
